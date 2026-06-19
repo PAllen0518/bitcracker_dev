@@ -1,0 +1,17 @@
+*.pyc
+*.pyo
+/addresses.db
+
+# Sensitive - wallet key files
+*.key
+
+# Sensitive - personal password/token search lists
+search*.txt
+token*.txt
+Testsearch.txt
+
+# Sensitive - search notes containing candidate passwords
+Allan Search Notes*.txt
+
+# Autosave/restore files from btcrecover runs
+savefile*
