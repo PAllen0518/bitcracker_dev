@@ -1,3 +1,5 @@
+CLAUDE
+.claude
 *.pyc
 *.pyo
 /addresses.db
