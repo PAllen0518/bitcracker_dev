@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""
+multibit_gpu.py - GPU-accelerated MultiBit Classic wallet password recovery.
+
+Reads btcrecover-compatible token list files, generates passwords on CPU,
+and checks them against a MultiBit .key file using an OpenCL kernel on the GPU.
+
+Usage:
+    python multibit_gpu.py --wallet multi.key --tokenlist search45.txt
+    python multibit_gpu.py --wallet multi.key --tokenlist search45.txt --autosave save.pkl
+    python multibit_gpu.py --restore save.pkl
+"""
+
+import sys, os, argparse, hashlib, base64, struct, pickle, time, itertools
+import string, re, collections, threading, queue as _queue
+from math import factorial
+
+try:
+    import pyopencl as cl
+    import numpy as np
+except ImportError:
+    sys.exit("Required: pip install pyopencl numpy")
+
+try:
+    from Crypto.Cipher import AES as _AES
+    def _cpu_aes_decrypt(key, iv, ct):
+        return _AES.new(key, _AES.MODE_CBC, iv).decrypt(ct)
+except ImportError:
+    sys.exit("Required: pip install pycryptodome")
+
+# ---------------------------------------------------------------------------
+# Precompute AES Td0 table (used in kernel for InvMixColumns)
+# ---------------------------------------------------------------------------
+
+def _build_td_tables():
+    SBOX_INV = [
+        0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+        0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+        0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+        0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+        0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+        0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+        0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+        0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+        0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+        0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+        0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+        0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+        0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+        0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+        0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+        0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
+    ]
+    def gmul(a, b):
+        p = 0
+        for _ in range(8):
+            if b & 1: p ^= a
+            hi = a & 0x80
+            a = ((a << 1) & 0xff)
+            if hi: a ^= 0x1b
+            b >>= 1
+        return p
+    def rotr8(x): return ((x >> 8) | (x << 24)) & 0xFFFFFFFF
+    td0 = []
+    for x in range(256):
+        s = SBOX_INV[x]
+        v = (gmul(14,s)<<24)|(gmul(9,s)<<16)|(gmul(13,s)<<8)|gmul(11,s)
+        td0.append(v)
+    td1 = [rotr8(v) for v in td0]
+    td2 = [rotr8(v) for v in td1]
+    td3 = [rotr8(v) for v in td2]
+    return td0, td1, td2, td3
+
+_TD0, _TD1, _TD2, _TD3 = _build_td_tables()
+
+def _arr_src(t): return "{ " + ", ".join("0x{:08x}u".format(v) for v in t) + " }"
+_TD0_SRC = _arr_src(_TD0)
+_TD1_SRC = _arr_src(_TD1)
+_TD2_SRC = _arr_src(_TD2)
+_TD3_SRC = _arr_src(_TD3)
+
+# ---------------------------------------------------------------------------
+# OpenCL kernel source
+# ---------------------------------------------------------------------------
+
+KERNEL_SOURCE = r"""
+/* MultiBit Classic GPU checker: 3x MD5 + AES-256-CBC + base58 validation */
+
+/* ---- MD5 ---- */
+#define F(x,y,z) (((x)&(y))|(~(x)&(z)))
+#define G(x,y,z) (((x)&(z))|((y)&~(z)))
+#define H(x,y,z) ((x)^(y)^(z))
+#define II(x,y,z) ((y)^((x)|~(z)))
+#define ROTL(x,n) rotate((uint)(x),(uint)(n))
+#define STEP(f,a,b,c,d,x,t,s) a+=f(b,c,d)+(x)+(uint)(t); a=ROTL(a,(uint)(s))+b;
+
+void md5_compress(uint *st, __private uint *blk) {
+    uint a=st[0],b=st[1],c=st[2],d=st[3];
+    STEP(F,a,b,c,d,blk[ 0],0xd76aa478u, 7) STEP(F,d,a,b,c,blk[ 1],0xe8c7b756u,12)
+    STEP(F,c,d,a,b,blk[ 2],0x242070dbu,17) STEP(F,b,c,d,a,blk[ 3],0xc1bdceeeu,22)
+    STEP(F,a,b,c,d,blk[ 4],0xf57c0fafu, 7) STEP(F,d,a,b,c,blk[ 5],0x4787c62au,12)
+    STEP(F,c,d,a,b,blk[ 6],0xa8304613u,17) STEP(F,b,c,d,a,blk[ 7],0xfd469501u,22)
+    STEP(F,a,b,c,d,blk[ 8],0x698098d8u, 7) STEP(F,d,a,b,c,blk[ 9],0x8b44f7afu,12)
+    STEP(F,c,d,a,b,blk[10],0xffff5bb1u,17) STEP(F,b,c,d,a,blk[11],0x895cd7beu,22)
+    STEP(F,a,b,c,d,blk[12],0x6b901122u, 7) STEP(F,d,a,b,c,blk[13],0xfd987193u,12)
+    STEP(F,c,d,a,b,blk[14],0xa679438eu,17) STEP(F,b,c,d,a,blk[15],0x49b40821u,22)
+    STEP(G,a,b,c,d,blk[ 1],0xf61e2562u, 5) STEP(G,d,a,b,c,blk[ 6],0xc040b340u, 9)
+    STEP(G,c,d,a,b,blk[11],0x265e5a51u,14) STEP(G,b,c,d,a,blk[ 0],0xe9b6c7aau,20)
+    STEP(G,a,b,c,d,blk[ 5],0xd62f105du, 5) STEP(G,d,a,b,c,blk[10],0x02441453u, 9)
+    STEP(G,c,d,a,b,blk[15],0xd8a1e681u,14) STEP(G,b,c,d,a,blk[ 4],0xe7d3fbc8u,20)
+    STEP(G,a,b,c,d,blk[ 9],0x21e1cde6u, 5) STEP(G,d,a,b,c,blk[14],0xc33707d6u, 9)
+    STEP(G,c,d,a,b,blk[ 3],0xf4d50d87u,14) STEP(G,b,c,d,a,blk[ 8],0x455a14edu,20)
+    STEP(G,a,b,c,d,blk[13],0xa9e3e905u, 5) STEP(G,d,a,b,c,blk[ 2],0xfcefa3f8u, 9)
+    STEP(G,c,d,a,b,blk[ 7],0x676f02d9u,14) STEP(G,b,c,d,a,blk[12],0x8d2a4c8au,20)
+    STEP(H,a,b,c,d,blk[ 5],0xfffa3942u, 4) STEP(H,d,a,b,c,blk[ 8],0x8771f681u,11)
+    STEP(H,c,d,a,b,blk[11],0x6d9d6122u,16) STEP(H,b,c,d,a,blk[14],0xfde5380cu,23)
+    STEP(H,a,b,c,d,blk[ 1],0xa4beea44u, 4) STEP(H,d,a,b,c,blk[ 4],0x4bdecfa9u,11)
+    STEP(H,c,d,a,b,blk[ 7],0xf6bb4b60u,16) STEP(H,b,c,d,a,blk[10],0xbebfbc70u,23)
+    STEP(H,a,b,c,d,blk[13],0x289b7ec6u, 4) STEP(H,d,a,b,c,blk[ 0],0xeaa127fau,11)
+    STEP(H,c,d,a,b,blk[ 3],0xd4ef3085u,16) STEP(H,b,c,d,a,blk[ 6],0x04881d05u,23)
+    STEP(H,a,b,c,d,blk[ 9],0xd9d4d039u, 4) STEP(H,d,a,b,c,blk[12],0xe6db99e5u,11)
+    STEP(H,c,d,a,b,blk[15],0x1fa27cf8u,16) STEP(H,b,c,d,a,blk[ 2],0xc4ac5665u,23)
+    STEP(II,a,b,c,d,blk[ 0],0xf4292244u, 6) STEP(II,d,a,b,c,blk[ 7],0x432aff97u,10)
+    STEP(II,c,d,a,b,blk[14],0xab9423a7u,15) STEP(II,b,c,d,a,blk[ 5],0xfc93a039u,21)
+    STEP(II,a,b,c,d,blk[12],0x655b59c3u, 6) STEP(II,d,a,b,c,blk[ 3],0x8f0ccc92u,10)
+    STEP(II,c,d,a,b,blk[10],0xffeff47du,15) STEP(II,b,c,d,a,blk[ 1],0x85845dd1u,21)
+    STEP(II,a,b,c,d,blk[ 8],0x6fa87e4fu, 6) STEP(II,d,a,b,c,blk[15],0xfe2ce6e0u,10)
+    STEP(II,c,d,a,b,blk[ 6],0xa3014314u,15) STEP(II,b,c,d,a,blk[13],0x4e0811a1u,21)
+    STEP(II,a,b,c,d,blk[ 4],0xf7537e82u, 6) STEP(II,d,a,b,c,blk[11],0xbd3af235u,10)
+    STEP(II,c,d,a,b,blk[ 2],0x2ad7d2bbu,15) STEP(II,b,c,d,a,blk[ 9],0xeb86d391u,21)
+    st[0]+=a; st[1]+=b; st[2]+=c; st[3]+=d;
+}
+
+/* Computes MD5 of data[0..len-1], writes 16-byte digest. Handles up to 128 bytes. */
+void md5(const uchar *data, uint len, uchar *digest) {
+    uint st[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+    uint blk[16];
+    uint i;
+
+    /* Process complete 64-byte blocks */
+    uint pos = 0;
+    while (pos + 64 <= len) {
+        for (i = 0; i < 16; i++) {
+            uint j = pos + i*4;
+            blk[i] = (uint)data[j] | ((uint)data[j+1]<<8) | ((uint)data[j+2]<<16) | ((uint)data[j+3]<<24);
+        }
+        md5_compress(st, blk);
+        pos += 64;
+    }
+
+    /* Final block(s) with padding */
+    uint rem = len - pos;
+    uchar buf[128];
+    for (i = 0; i < rem; i++)  buf[i] = data[pos+i];
+    buf[rem] = 0x80;
+    for (i = rem+1; i < 128; i++) buf[i] = 0;
+
+    /* Bit-length as 64-bit little-endian */
+    ulong bits = (ulong)len * 8;
+    uint off = (rem < 56) ? 56 : 120;
+    buf[off+0]=(uchar)(bits    ); buf[off+1]=(uchar)(bits>> 8);
+    buf[off+2]=(uchar)(bits>>16); buf[off+3]=(uchar)(bits>>24);
+    buf[off+4]=(uchar)(bits>>32); buf[off+5]=(uchar)(bits>>40);
+    buf[off+6]=(uchar)(bits>>48); buf[off+7]=(uchar)(bits>>56);
+
+    uint nblocks = (rem < 56) ? 1 : 2;
+    for (uint b = 0; b < nblocks; b++) {
+        for (i = 0; i < 16; i++) {
+            uint j = b*64 + i*4;
+            blk[i] = (uint)buf[j] | ((uint)buf[j+1]<<8) | ((uint)buf[j+2]<<16) | ((uint)buf[j+3]<<24);
+        }
+        md5_compress(st, blk);
+    }
+
+    for (i = 0; i < 4; i++) {
+        digest[i*4+0]=(uchar)(st[i]    ); digest[i*4+1]=(uchar)(st[i]>> 8);
+        digest[i*4+2]=(uchar)(st[i]>>16); digest[i*4+3]=(uchar)(st[i]>>24);
+    }
+}
+
+/* ---- AES-256 ---- */
+
+__constant uint SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+/* AES InvMixColumns tables, precomputed by Python */
+__constant uint TD0[256] = """ + _TD0_SRC + r""";
+__constant uint TD1[256] = """ + _TD1_SRC + r""";
+__constant uint TD2[256] = """ + _TD2_SRC + r""";
+__constant uint TD3[256] = """ + _TD3_SRC + r""";
+
+/* AES-256 key schedule: expand 32-byte key, then transform middle round keys
+   for use with the equivalent inverse cipher (TD-table based decryption).
+   rk[0..3] and rk[56..59] stay as-is; rk[4..55] get InvMixColumns applied. */
+void aes256_key_expand(const uchar *key, __private uint *rk) {
+    /* Step 1: standard AES-256 key expansion */
+    const uint RCON[7] = {0x01000000u,0x02000000u,0x04000000u,0x08000000u,
+                          0x10000000u,0x20000000u,0x40000000u};
+    for (int i = 0; i < 8; i++)
+        rk[i] = ((uint)key[i*4]<<24)|((uint)key[i*4+1]<<16)|((uint)key[i*4+2]<<8)|key[i*4+3];
+    for (int i = 8; i < 60; i++) {
+        uint t = rk[i-1];
+        if (i % 8 == 0) {
+            t = (SBOX[(t>>16)&0xff]<<24)|(SBOX[(t>>8)&0xff]<<16)|(SBOX[t&0xff]<<8)|SBOX[(t>>24)&0xff];
+            t ^= RCON[i/8 - 1];
+        } else if (i % 8 == 4) {
+            t = (SBOX[(t>>24)&0xff]<<24)|(SBOX[(t>>16)&0xff]<<16)|(SBOX[(t>>8)&0xff]<<8)|SBOX[t&0xff];
+        }
+        rk[i] = rk[i-8] ^ t;
+    }
+    /* Step 2: apply InvMixColumns to round key words 4..55 so that the
+       TD-table XOR in each middle round produces the correct result.
+       InvMixColumns(w) = TD0[SBOX[b0]] ^ TD1[SBOX[b1]] ^ TD2[SBOX[b2]] ^ TD3[SBOX[b3]] */
+    for (int i = 4; i < 56; i++) {
+        uint w = rk[i];
+        rk[i] = TD0[SBOX[(w>>24)&0xff]] ^ TD1[SBOX[(w>>16)&0xff]]
+               ^ TD2[SBOX[(w>>8)&0xff]]  ^ TD3[SBOX[w&0xff]];
+    }
+}
+
+
+__constant uchar SBOX_INV[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+
+/* AES-256 CBC decrypt a single 16-byte block, XOR with xor_block (IV or previous ciphertext) */
+void aes256_cbc_decrypt(const uchar *key32, const uchar *xor_block, const uchar *ct, uchar *pt) {
+    uint rk[60];
+    aes256_key_expand(key32, rk);
+
+    uint s0 = ((uint)ct[ 0]<<24)|((uint)ct[ 1]<<16)|((uint)ct[ 2]<<8)|ct[ 3];
+    uint s1 = ((uint)ct[ 4]<<24)|((uint)ct[ 5]<<16)|((uint)ct[ 6]<<8)|ct[ 7];
+    uint s2 = ((uint)ct[ 8]<<24)|((uint)ct[ 9]<<16)|((uint)ct[10]<<8)|ct[11];
+    uint s3 = ((uint)ct[12]<<24)|((uint)ct[13]<<16)|((uint)ct[14]<<8)|ct[15];
+
+    s0^=rk[56]; s1^=rk[57]; s2^=rk[58]; s3^=rk[59];
+
+    uint t0,t1,t2,t3;
+    for (int r = 13; r >= 1; r--) {
+        t0 = TD0[(s0>>24)&0xff]^TD1[(s3>>16)&0xff]^TD2[(s2>>8)&0xff]^TD3[s1&0xff]^rk[r*4+0];
+        t1 = TD0[(s1>>24)&0xff]^TD1[(s0>>16)&0xff]^TD2[(s3>>8)&0xff]^TD3[s2&0xff]^rk[r*4+1];
+        t2 = TD0[(s2>>24)&0xff]^TD1[(s1>>16)&0xff]^TD2[(s0>>8)&0xff]^TD3[s3&0xff]^rk[r*4+2];
+        t3 = TD0[(s3>>24)&0xff]^TD1[(s2>>16)&0xff]^TD2[(s1>>8)&0xff]^TD3[s0&0xff]^rk[r*4+3];
+        s0=t0; s1=t1; s2=t2; s3=t3;
+    }
+    /* Final round: InvShiftRows + InvSubBytes (no InvMixColumns) */
+    t0 = ((uint)SBOX_INV[(s0>>24)&0xff]<<24)|((uint)SBOX_INV[(s3>>16)&0xff]<<16)|((uint)SBOX_INV[(s2>>8)&0xff]<<8)|SBOX_INV[s1&0xff];
+    t1 = ((uint)SBOX_INV[(s1>>24)&0xff]<<24)|((uint)SBOX_INV[(s0>>16)&0xff]<<16)|((uint)SBOX_INV[(s3>>8)&0xff]<<8)|SBOX_INV[s2&0xff];
+    t2 = ((uint)SBOX_INV[(s2>>24)&0xff]<<24)|((uint)SBOX_INV[(s1>>16)&0xff]<<16)|((uint)SBOX_INV[(s0>>8)&0xff]<<8)|SBOX_INV[s3&0xff];
+    t3 = ((uint)SBOX_INV[(s3>>24)&0xff]<<24)|((uint)SBOX_INV[(s2>>16)&0xff]<<16)|((uint)SBOX_INV[(s1>>8)&0xff]<<8)|SBOX_INV[s0&0xff];
+
+    /* AddRoundKey (round 0) */
+    t0^=rk[0]; t1^=rk[1]; t2^=rk[2]; t3^=rk[3];
+
+    /* XOR with IV / previous ciphertext block (CBC) */
+    uint x0 = ((uint)xor_block[ 0]<<24)|((uint)xor_block[ 1]<<16)|((uint)xor_block[ 2]<<8)|xor_block[ 3];
+    uint x1 = ((uint)xor_block[ 4]<<24)|((uint)xor_block[ 5]<<16)|((uint)xor_block[ 6]<<8)|xor_block[ 7];
+    uint x2 = ((uint)xor_block[ 8]<<24)|((uint)xor_block[ 9]<<16)|((uint)xor_block[10]<<8)|xor_block[11];
+    uint x3 = ((uint)xor_block[12]<<24)|((uint)xor_block[13]<<16)|((uint)xor_block[14]<<8)|xor_block[15];
+    t0^=x0; t1^=x1; t2^=x2; t3^=x3;
+
+    pt[ 0]=(uchar)(t0>>24); pt[ 1]=(uchar)(t0>>16); pt[ 2]=(uchar)(t0>>8); pt[ 3]=(uchar)t0;
+    pt[ 4]=(uchar)(t1>>24); pt[ 5]=(uchar)(t1>>16); pt[ 6]=(uchar)(t1>>8); pt[ 7]=(uchar)t1;
+    pt[ 8]=(uchar)(t2>>24); pt[ 9]=(uchar)(t2>>16); pt[10]=(uchar)(t2>>8); pt[11]=(uchar)t2;
+    pt[12]=(uchar)(t3>>24); pt[13]=(uchar)(t3>>16); pt[14]=(uchar)(t3>>8); pt[15]=(uchar)t3;
+}
+
+/* ---- Base58 validation ---- */
+/* Returns 1 if ALL bytes in buf[0..len-1] are valid base58 characters */
+int all_b58(const uchar *buf, uint len) {
+    for (uint i = 0; i < len; i++) {
+        uchar c = buf[i];
+        if (c < '1' || c > 'z') return 0;
+        if (c > '9' && c < 'A') return 0;
+        if (c > 'Z' && c < 'a') return 0;
+        if (c == 'I' || c == 'O' || c == 'l') return 0;
+    }
+    return 1;
+}
+
+/* ---- Main kernel ---- */
+/*
+ * Each work item processes one password.
+ * pw_data:   packed passwords, each occupying pw_stride bytes (null-padded)
+ * pw_lens:   byte length of each password
+ * salt:      8-byte MultiBit salt (constant for all passwords)
+ * enc:       32-byte encrypted data (two 16-byte AES blocks) from the wallet
+ * found_idx: output - set to (global_id + 1) of the first found password, or 0
+ */
+__kernel void multibit_check(
+    __global const uchar *pw_data,
+    __global const uint  *pw_lens,
+    __constant     uchar *salt,
+    __constant     uchar *enc,
+    __global       uint  *found_idx,
+    const          uint   pw_stride
+) {
+    uint gid = get_global_id(0);
+
+    uint pw_len = pw_lens[gid];
+    if (pw_len == 0) return;
+
+    /* Build salted = password + salt (max 128 bytes) */
+    uchar salted[136];
+    __global const uchar *pw = pw_data + gid * pw_stride;
+    for (uint i = 0; i < pw_len; i++) salted[i] = pw[i];
+    for (uint i = 0; i < 8; i++)     salted[pw_len + i] = salt[i];
+    uint salted_len = pw_len + 8;
+
+    /* key1 = MD5(salted) */
+    uchar key1[16];
+    md5(salted, salted_len, key1);
+
+    /* key2 = MD5(key1 + salted) */
+    uchar tmp[152];
+    for (uint i = 0; i < 16; i++)         tmp[i]    = key1[i];
+    for (uint i = 0; i < salted_len; i++) tmp[16+i] = salted[i];
+    uchar key2[16];
+    md5(tmp, 16 + salted_len, key2);
+
+    /* iv = MD5(key2 + salted) */
+    for (uint i = 0; i < 16; i++)         tmp[i]    = key2[i];
+    /* salted already in tmp[16..] from above */
+    uchar iv[16];
+    md5(tmp, 16 + salted_len, iv);
+
+    /* aes_key = key1 + key2 */
+    uchar aes_key[32];
+    for (uint i = 0; i < 16; i++) aes_key[i]    = key1[i];
+    for (uint i = 0; i < 16; i++) aes_key[16+i] = key2[i];
+
+    /* Copy enc to private memory (NVIDIA OpenCL requires matching address spaces) */
+    uchar enc_local[32];
+    for (uint i = 0; i < 32; i++) enc_local[i] = enc[i];
+
+    /* Decrypt first AES block (IV = iv, CT = enc_local[0..15]) */
+    uchar pt1[16];
+    aes256_cbc_decrypt(aes_key, iv, enc_local, pt1);
+
+    /* Quick check: first byte must be L, K, 5, or Q */
+    uchar b0 = pt1[0];
+    if (b0 != 'L' && b0 != 'K' && b0 != '5' && b0 != 'Q') return;
+
+    /* Remaining 15 bytes of first block must all be valid base58 */
+    if (!all_b58(pt1 + 1, 15)) return;
+
+    /* Decrypt second AES block (IV = first ciphertext block = enc_local[0..15]) */
+    uchar pt2[16];
+    aes256_cbc_decrypt(aes_key, enc_local, enc_local + 16, pt2);
+    if (!all_b58(pt2, 16)) return;
+
+    /* Found! Record this work item's index (1-based) */
+    atomic_cmpxchg(found_idx, 0u, gid + 1u);
+}
+"""
+
+# ---------------------------------------------------------------------------
+# MultiBit wallet loader
+# ---------------------------------------------------------------------------
+
+class WalletMultiBit:
+    def __init__(self, encrypted_block, salt):
+        self._enc   = encrypted_block  # 32 bytes
+        self._salt  = salt             # 8 bytes
+
+    @classmethod
+    def load(cls, filename):
+        with open(filename, "r") as f:
+            raw = f.read(70)
+        data = b"".join(raw.encode("ascii").split())
+        if len(data) < 64:
+            raise ValueError("MultiBit key file too short")
+        data = base64.b64decode(data[:64])
+        assert data[:8] == b"Salted__", "Not a MultiBit key file"
+        if len(data) < 48:
+            raise ValueError("MultiBit key file decodes to less than 48 bytes")
+        return cls(encrypted_block=data[16:48], salt=data[8:16])
+
+    def verify_cpu(self, password):
+        """CPU verification for confirming a GPU hit."""
+        pw_bytes = password.encode("utf-16-le")[::2]
+        salted = pw_bytes + self._salt
+        key1 = hashlib.md5(salted).digest()
+        key2 = hashlib.md5(key1 + salted).digest()
+        iv   = hashlib.md5(key2 + salted).digest()
+        aes_key = key1 + key2
+        pt = _cpu_aes_decrypt(aes_key, iv, self._enc[:16])
+        if pt[0:1] not in (b"L", b"K", b"5", b"Q"):
+            return False
+        b58 = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        if pt[1:].translate(None, b58):
+            return False
+        pt2 = _cpu_aes_decrypt(aes_key, self._enc[:16], self._enc[16:32])
+        return not pt2.translate(None, b58)
+
+# ---------------------------------------------------------------------------
+# OpenCL engine
+# ---------------------------------------------------------------------------
+
+BATCH_SIZE   = 524288   # 8x larger: GPU processes faster than CPU generates
+PW_STRIDE    = 128      # max password length in bytes
+
+class GPUEngine:
+    def __init__(self, wallet, batch_size=BATCH_SIZE):
+        self._wallet     = wallet
+        self._batch_size = batch_size
+        platforms = cl.get_platforms()
+        gpu_devices = []
+        for p in platforms:
+            gpu_devices += p.get_devices(cl.device_type.GPU)
+        if not gpu_devices:
+            sys.exit("No OpenCL GPU devices found.")
+        self._device  = gpu_devices[0]
+        print(f"Using GPU: {self._device.name.strip()}")
+        self._ctx     = cl.Context([self._device])
+        self._queue   = cl.CommandQueue(self._ctx)
+        self._program = cl.Program(self._ctx, KERNEL_SOURCE).build()
+        self._kernel  = self._program.multibit_check
+
+        mf = cl.mem_flags
+        enc_np   = np.frombuffer(wallet._enc,  dtype=np.uint8)
+        salt_np  = np.frombuffer(wallet._salt, dtype=np.uint8)
+        self._enc_buf  = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=enc_np)
+        self._salt_buf = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=salt_np)
+
+        self._pw_buf    = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * PW_STRIDE)
+        self._len_buf   = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * 4)
+        self._found_buf = cl.Buffer(self._ctx, mf.READ_WRITE, 4)
+        self._found_np  = np.zeros(1, dtype=np.uint32)
+
+    def check_batch(self, passwords):
+        """Check a list of password strings on the GPU.
+        Returns the found password string, or None."""
+        n = len(passwords)
+        stride = PW_STRIDE
+
+        # Fast packing: build into a bytearray (avoids per-row np.frombuffer calls)
+        raw = bytearray(n * stride)
+        len_arr = np.zeros(n, dtype=np.uint32)
+        for i, pw in enumerate(passwords):
+            pb = pw.encode("ascii", "ignore")
+            l = len(pb)
+            if l > stride:
+                l = stride
+                pb = pb[:stride]
+            raw[i*stride : i*stride+l] = pb
+            len_arr[i] = l
+
+        pw_np = np.frombuffer(raw, dtype=np.uint8)
+        self._found_np[0] = 0
+
+        cl.enqueue_copy(self._queue, self._pw_buf,    pw_np)
+        cl.enqueue_copy(self._queue, self._len_buf,   len_arr)
+        cl.enqueue_copy(self._queue, self._found_buf, self._found_np)
+
+        self._kernel(
+            self._queue, (n,), None,
+            self._pw_buf, self._len_buf,
+            self._salt_buf, self._enc_buf,
+            self._found_buf,
+            np.uint32(stride)
+        )
+        cl.enqueue_copy(self._queue, self._found_np, self._found_buf)
+        self._queue.finish()
+
+        if self._found_np[0]:
+            candidate = passwords[self._found_np[0] - 1]
+            if self._wallet.verify_cpu(candidate):
+                return candidate
+        return None
+
+# ---------------------------------------------------------------------------
+# Token list parser and password generator (ported from btcrpass.py)
+# ---------------------------------------------------------------------------
+
+class AnchoredToken:
+    POSITIONAL = 1
+    RELATIVE   = 2
+    MIDDLE     = 3
+
+    def __init__(self, token, line_num="?"):
+        if token.startswith("^"):
+            m = re.match(r"\^(?:(?P<begin>\d+)?(?P<middle>,)(?P<end>\d+)?|(?P<rel>[rR])?(?P<pos>\d+))[\^$]", token)
+            if m:
+                if m.group("middle"):
+                    begin = int(m.group("begin")) if m.group("begin") else 2
+                    end   = int(m.group("end"))   if m.group("end")   else sys.maxsize
+                    if begin > end or begin < 2:
+                        raise ValueError(f"line {line_num}: invalid anchor range")
+                    self.type  = self.MIDDLE
+                    self.begin = begin - 1
+                    self.end   = end   - 1 if end != sys.maxsize else end
+                else:
+                    pos = int(m.group("pos"))
+                    if m.group("rel"):
+                        self.type = self.RELATIVE
+                        self.pos  = pos
+                    else:
+                        self.type = self.POSITIONAL
+                        self.pos  = pos - 1
+                self.text = token[m.end():]
+            else:
+                self.type = self.POSITIONAL
+                self.pos  = 0
+                self.text = token[1:]
+            if self.text.endswith("$"):
+                raise ValueError(f"line {line_num}: token has both ^ and $ anchors")
+        elif token.endswith("$"):
+            self.type = self.POSITIONAL
+            self.pos  = "$"
+            self.text = token[:-1]
+        else:
+            raise ValueError("Not an anchored token")
+        self._str  = token
+        self._hash = hash(self._str)
+
+    def __hash__(self):      return self._hash
+    def __eq__(self, o):     return isinstance(o, AnchoredToken) and self._str == o._str
+    def __str__(self):       return self._str
+    def __repr__(self):      return f"AnchoredToken({self._str!r})"
+
+
+def _expand_wildcard(wc_str):
+    """Expand a single wildcard spec like '%d', '%0,4d', '%3,4[0-9]' into a list of strings."""
+    # %[N[,M]]<type>  or  %[N[,M]][<charset>]
+    m = re.match(r"%(?:(\d+)(?:,(\d+))?)?(\[.+?\]|[dansANpPyYwWsltTrRbS%^]|i[dansAN])", wc_str)
+    if not m:
+        return [wc_str]  # not a recognized wildcard, return as-is
+
+    min_r = int(m.group(1)) if m.group(1) is not None else 1
+    max_r = int(m.group(2)) if m.group(2) is not None else min_r
+    wtype = m.group(3)
+
+    sets = {
+        "d": string.digits,
+        "a": string.ascii_lowercase,
+        "A": string.ascii_uppercase,
+        "n": string.ascii_lowercase + string.digits,
+        "N": string.ascii_uppercase + string.digits,
+        "s": " ",
+        "p": "".join(chr(c) for c in range(33, 127)),
+        "y": string.punctuation,
+        "Y": string.digits + string.punctuation,
+    }
+
+    if wtype.startswith("[") and wtype.endswith("]"):
+        charset = wtype[1:-1]
+        # Handle ranges like 0-9, a-z
+        expanded = ""
+        i = 0
+        while i < len(charset):
+            if i+2 < len(charset) and charset[i+1] == "-":
+                for c in range(ord(charset[i]), ord(charset[i+2])+1):
+                    expanded += chr(c)
+                i += 3
+            else:
+                expanded += charset[i]
+                i += 1
+        chars = expanded
+    elif wtype.startswith("i"):
+        base = sets.get(wtype[1], "")
+        chars = base.upper() + base.lower() if wtype[1].islower() else base.lower() + base.upper()
+    else:
+        chars = sets.get(wtype, wtype)
+
+    results = []
+    for length in range(min_r, max_r + 1):
+        for combo in itertools.product(chars, repeat=length):
+            results.append("".join(combo))
+    return results
+
+
+def _token_to_strings(token):
+    """Expand a token string (possibly containing wildcards) into a list of concrete strings."""
+    if "%" not in token:
+        return [token]
+    # Find wildcards and expand them
+    parts = re.split(r"(%(?:\d+(?:,\d+)?)?(?:\[.+?\]|[a-zA-Z%^]))", token)
+    options = [[]]
+    for part in parts:
+        if part.startswith("%"):
+            expanded = _expand_wildcard(part)
+            options = [prev + [e] for prev in options for e in expanded]
+        else:
+            options = [prev + [part] for prev in options]
+    return ["".join(p) for p in options]
+
+
+def parse_tokenlist(filepath):
+    """Parse a btcrecover token list file. Returns token_lists structure."""
+    token_lists = []
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.rstrip("\r\n")
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            required = False
+            if parts[0] == "+":
+                required = True
+                parts = parts[1:]
+                if not parts:
+                    continue
+
+            tokens = []
+            for raw in parts:
+                if raw.startswith("^") or raw.endswith("$"):
+                    try:
+                        tok = AnchoredToken(raw, line_num)
+                        # Expand wildcards in the token's text
+                        expanded_texts = _token_to_strings(tok.text)
+                        for et in expanded_texts:
+                            at = AnchoredToken.__new__(AnchoredToken)
+                            at.type = tok.type
+                            at.pos  = tok.pos if hasattr(tok, "pos") else None
+                            if hasattr(tok, "begin"): at.begin = tok.begin
+                            if hasattr(tok, "end"):   at.end   = tok.end
+                            at.text  = et
+                            at._str  = raw
+                            at._hash = hash(raw)
+                            tokens.append(at)
+                    except ValueError:
+                        tokens.extend(_token_to_strings(raw))
+                else:
+                    tokens.extend(_token_to_strings(raw))
+
+            if not tokens:
+                continue
+
+            if required:
+                token_lists.append(tokens)          # required: no leading None
+            else:
+                token_lists.append([None] + tokens) # optional: leading None means "skip"
+
+    token_lists.reverse()  # btcrecover convention: last line tried first
+    return token_lists
+
+
+def _assemble(ordered_tokens):
+    """Assemble an ordered list of tokens (strings + AnchoredTokens) into a password string."""
+    n = len(ordered_tokens)
+    result = [None] * n
+    free   = []
+
+    for tok in ordered_tokens:
+        if isinstance(tok, AnchoredToken):
+            if tok.type == AnchoredToken.POSITIONAL:
+                pos = tok.pos if tok.pos != "$" else n - 1
+                if pos >= n or result[pos] is not None:
+                    return None  # conflict
+                result[pos] = tok.text
+            else:
+                free.append(tok)
+        else:
+            free.append(tok)
+
+    # Fill free slots in order
+    slot = 0
+    for tok in free:
+        while slot < n and result[slot] is not None:
+            slot += 1
+        if slot >= n:
+            return None
+        if isinstance(tok, AnchoredToken):
+            if tok.type == AnchoredToken.MIDDLE:
+                adj = sum(1 for r in result[:slot+1] if r is not None) + \
+                      sum(1 for f in free[:free.index(tok)] if not isinstance(f, AnchoredToken))
+                actual_pos = slot
+                if not (tok.begin <= actual_pos <= tok.end):
+                    return None
+            result[slot] = tok.text
+        else:
+            result[slot] = tok
+
+        slot += 1
+
+    if None in result:
+        return None
+    return "".join(result)
+
+
+def _count_combo_passwords(tokens):
+    """Count passwords a combo yields without generating them (O(n) per combo)."""
+    n = len(tokens)
+    has_anchors = any(isinstance(t, AnchoredToken) for t in tokens)
+    if not has_anchors:
+        return factorial(n)
+    positional = {}
+    free_tokens = []
+    for tok in tokens:
+        if isinstance(tok, AnchoredToken) and tok.type == AnchoredToken.POSITIONAL:
+            pos = tok.pos if tok.pos != "$" else n - 1
+            if pos in positional:
+                return 0  # conflict — combo produces nothing
+            positional[pos] = tok.text
+        else:
+            free_tokens.append(tok)
+    return factorial(len(free_tokens))
+
+
+def find_combo_position(token_lists, target_skip):
+    """Return (combo_idx, skip_in_combo) for a target password count.
+    Iterates product at C speed, counting per combo without building strings."""
+    count = 0
+    last_idx = 0
+    for combo_idx, combo in enumerate(itertools.product(*token_lists)):
+        last_idx = combo_idx
+        tokens = [t for t in combo if t is not None]
+        if not tokens:
+            continue
+        pw_count = _count_combo_passwords(tokens)
+        if count + pw_count > target_skip:
+            return combo_idx, target_skip - count
+        count += pw_count
+        if count == target_skip:
+            return combo_idx + 1, 0
+    return last_idx + 1, 0
+
+
+def password_generator(token_lists, start_combo=0, skip_in_combo=0):
+    """Yields (combo_idx, pw_in_combo, password).
+    start_combo: product iterator is advanced to this index at C speed.
+    skip_in_combo: passwords to skip within the first combo."""
+    product_iter = itertools.product(*token_lists)
+    if start_combo > 0:
+        for _ in itertools.islice(product_iter, start_combo):
+            pass
+
+    for combo_idx, combo in enumerate(product_iter, start=start_combo):
+        tokens = [t for t in combo if t is not None]
+        if not tokens:
+            continue
+
+        n = len(tokens)
+        has_anchors = any(isinstance(t, AnchoredToken) for t in tokens)
+        first_combo = (combo_idx == start_combo)
+
+        if not has_anchors:
+            pw_in_combo = 0
+            for perm in itertools.permutations(tokens):
+                if first_combo and pw_in_combo < skip_in_combo:
+                    pw_in_combo += 1
+                    continue
+                yield combo_idx, pw_in_combo, "".join(perm)
+                pw_in_combo += 1
+            continue
+
+        positional = {}
+        free_tokens = []
+        skip = False
+        for tok in tokens:
+            if isinstance(tok, AnchoredToken) and tok.type == AnchoredToken.POSITIONAL:
+                pos = tok.pos if tok.pos != "$" else n - 1
+                if pos in positional:
+                    skip = True
+                    break
+                positional[pos] = tok.text
+            else:
+                free_tokens.append(tok)
+
+        if skip:
+            continue
+
+        pw_in_combo = 0
+        for perm in itertools.permutations(free_tokens):
+            result = [None] * n
+            for pos, text in positional.items():
+                result[pos] = text
+            free_idx = 0
+            for i in range(n):
+                if result[i] is None:
+                    tok = perm[free_idx]
+                    result[i] = tok.text if isinstance(tok, AnchoredToken) else tok
+                    free_idx += 1
+            if None not in result:
+                if first_combo and pw_in_combo < skip_in_combo:
+                    pw_in_combo += 1
+                    continue
+                yield combo_idx, pw_in_combo, "".join(result)
+                pw_in_combo += 1
+
+# ---------------------------------------------------------------------------
+# Save / restore
+# ---------------------------------------------------------------------------
+
+def save_state(path, skip_count, combo_idx, perm_idx, tokenlist_path, wallet_path):
+    state = {
+        "skip":      skip_count,
+        "combo_idx": combo_idx,
+        "perm_idx":  perm_idx,
+        "tokenlist": tokenlist_path,
+        "wallet":    wallet_path,
+    }
+    with open(path, "wb") as f:
+        pickle.dump(state, f)
+
+def load_state(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _batch_producer(gen, batch_size, q):
+    """Background thread: pulls (combo_idx, pw_in_combo, pw) from gen, queues batches."""
+    batch_pws  = []
+    last_combo = 0
+    last_perm  = 0
+    for combo_idx, pw_in_combo, pw in gen:
+        batch_pws.append(pw)
+        last_combo = combo_idx
+        last_perm  = pw_in_combo
+        if len(batch_pws) >= batch_size:
+            q.put((batch_pws, last_combo, last_perm))
+            batch_pws = []
+    if batch_pws:
+        q.put((batch_pws, last_combo, last_perm))
+    q.put(None)  # sentinel
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MultiBit GPU password recovery")
+    parser.add_argument("--wallet",    help="Path to MultiBit .key file")
+    parser.add_argument("--tokenlist", help="Path to btcrecover token list file")
+    parser.add_argument("--skip",      type=int, default=0, help="Skip first N passwords")
+    parser.add_argument("--autosave",  help="Save progress to this file every batch")
+    parser.add_argument("--restore",   help="Restore progress from a save file")
+    parser.add_argument("--batch-size",type=int, default=BATCH_SIZE, help="GPU batch size")
+    args = parser.parse_args()
+
+    skip_count     = args.skip
+    tokenlist_path = args.tokenlist
+    wallet_path    = args.wallet
+    start_combo    = 0
+    start_perm     = 0
+
+    if args.restore:
+        state = load_state(args.restore)
+        skip_count     = state["skip"]
+        tokenlist_path = state["tokenlist"]
+        wallet_path    = state["wallet"]
+        start_combo    = state.get("combo_idx")   # None if old-format save
+        start_perm     = state.get("perm_idx", 0)
+        print(f"Restored from {args.restore}, resuming at password #{skip_count:,}")
+
+    if not wallet_path or not tokenlist_path:
+        parser.error("--wallet and --tokenlist are required (or --restore)")
+
+    wallet      = WalletMultiBit.load(wallet_path)
+    token_lists = parse_tokenlist(tokenlist_path)
+    batch_size  = args.batch_size
+    engine      = GPUEngine(wallet, batch_size)
+
+    # Old save files only store skip_count, not combo_idx.
+    # Run a fast counting pass (no string building) to locate the combo position.
+    if args.restore and start_combo is None and skip_count > 0:
+        print(f"One-time migration: locating password #{skip_count:,} in token list...", end=" ", flush=True)
+        t0 = time.time()
+        start_combo, start_perm = find_combo_position(token_lists, skip_count)
+        print(f"done in {time.time()-t0:.1f}s  (combo {start_combo:,}, perm {start_perm})")
+        save_state(args.restore, skip_count, start_combo, start_perm, tokenlist_path, wallet_path)
+    elif start_combo is None:
+        start_combo = 0
+        start_perm  = 0
+
+    prefetch_q = _queue.Queue(maxsize=2)
+    gen = password_generator(token_lists, start_combo=start_combo, skip_in_combo=start_perm)
+    producer = threading.Thread(
+        target=_batch_producer,
+        args=(gen, batch_size, prefetch_q),
+        daemon=True,
+    )
+    producer.start()
+
+    total          = skip_count
+    last_combo_idx = start_combo
+    last_perm_idx  = start_perm
+    start_time     = time.time()
+    last_save      = time.time()
+
+    print(f"Starting at password #{skip_count:,}  (batch size {batch_size:,})")
+
+    while True:
+        item = prefetch_q.get()
+        if item is None:
+            break
+
+        batch, last_combo_idx, last_perm_idx = item
+        result = engine.check_batch(batch)
+        total += len(batch)
+
+        if result:
+            print(f"\n*** PASSWORD FOUND: '{result}' ***")
+            if args.autosave:
+                save_state(args.autosave, total, last_combo_idx, last_perm_idx, tokenlist_path, wallet_path)
+            return
+
+        elapsed = time.time() - start_time
+        rate    = total / elapsed if elapsed > 0 else 0
+        print(f"\r{total:>16,} passwords  {rate:>10,.0f}/s", end="", flush=True)
+
+        if args.autosave and time.time() - last_save > 30:
+            save_state(args.autosave, total, last_combo_idx, last_perm_idx, tokenlist_path, wallet_path)
+            last_save = time.time()
+
+    elapsed = time.time() - start_time
+    rate    = total / elapsed if elapsed > 0 else 0
+    print(f"\nSearch complete. {total:,} passwords checked in {elapsed:.1f}s ({rate:,.0f}/s). Password not found.")
+
+if __name__ == "__main__":
+    main()
