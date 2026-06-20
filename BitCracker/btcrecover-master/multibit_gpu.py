@@ -216,11 +216,11 @@ __constant uint TD1[256] = """ + _TD1_SRC + r""";
 __constant uint TD2[256] = """ + _TD2_SRC + r""";
 __constant uint TD3[256] = """ + _TD3_SRC + r""";
 
-/* AES-256 key schedule using local-memory copies of SBOX and TD tables. */
-void aes256_key_expand(const uchar *key, __private uint *rk,
-                       __local const uchar *l_SBOX,
-                       __local const uint  *l_TD0, __local const uint *l_TD1,
-                       __local const uint  *l_TD2, __local const uint *l_TD3) {
+/* AES-256 key schedule: expand 32-byte key, then transform middle round keys
+   for use with the equivalent inverse cipher (TD-table based decryption).
+   rk[0..3] and rk[56..59] stay as-is; rk[4..55] get InvMixColumns applied. */
+void aes256_key_expand(const uchar *key, __private uint *rk) {
+    /* Step 1: standard AES-256 key expansion */
     const uint RCON[7] = {0x01000000u,0x02000000u,0x04000000u,0x08000000u,
                           0x10000000u,0x20000000u,0x40000000u};
     for (int i = 0; i < 8; i++)
@@ -228,19 +228,20 @@ void aes256_key_expand(const uchar *key, __private uint *rk,
     for (int i = 8; i < 60; i++) {
         uint t = rk[i-1];
         if (i % 8 == 0) {
-            t = ((uint)l_SBOX[(t>>16)&0xff]<<24)|((uint)l_SBOX[(t>>8)&0xff]<<16)
-               |((uint)l_SBOX[t&0xff]<<8)|(uint)l_SBOX[(t>>24)&0xff];
+            t = (SBOX[(t>>16)&0xff]<<24)|(SBOX[(t>>8)&0xff]<<16)|(SBOX[t&0xff]<<8)|SBOX[(t>>24)&0xff];
             t ^= RCON[i/8 - 1];
         } else if (i % 8 == 4) {
-            t = ((uint)l_SBOX[(t>>24)&0xff]<<24)|((uint)l_SBOX[(t>>16)&0xff]<<16)
-               |((uint)l_SBOX[(t>>8)&0xff]<<8)|(uint)l_SBOX[t&0xff];
+            t = (SBOX[(t>>24)&0xff]<<24)|(SBOX[(t>>16)&0xff]<<16)|(SBOX[(t>>8)&0xff]<<8)|SBOX[t&0xff];
         }
         rk[i] = rk[i-8] ^ t;
     }
+    /* Step 2: apply InvMixColumns to round key words 4..55 so that the
+       TD-table XOR in each middle round produces the correct result.
+       InvMixColumns(w) = TD0[SBOX[b0]] ^ TD1[SBOX[b1]] ^ TD2[SBOX[b2]] ^ TD3[SBOX[b3]] */
     for (int i = 4; i < 56; i++) {
         uint w = rk[i];
-        rk[i] = l_TD0[l_SBOX[(w>>24)&0xff]] ^ l_TD1[l_SBOX[(w>>16)&0xff]]
-               ^ l_TD2[l_SBOX[(w>>8)&0xff]]  ^ l_TD3[l_SBOX[w&0xff]];
+        rk[i] = TD0[SBOX[(w>>24)&0xff]] ^ TD1[SBOX[(w>>16)&0xff]]
+               ^ TD2[SBOX[(w>>8)&0xff]]  ^ TD3[SBOX[w&0xff]];
     }
 }
 
@@ -264,12 +265,8 @@ __constant uchar SBOX_INV[256] = {
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 };
 
-/* AES-256 CBC decrypt a single 16-byte block given pre-expanded round keys.
-   Uses local-memory TD tables and SBOX_INV for faster non-broadcast lookups. */
-void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const uchar *ct, uchar *pt,
-                          __local const uint  *l_TD0, __local const uint  *l_TD1,
-                          __local const uint  *l_TD2, __local const uint  *l_TD3,
-                          __local const uchar *l_SBOX_INV) {
+/* AES-256 CBC decrypt a single 16-byte block given pre-expanded round keys */
+void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const uchar *ct, uchar *pt) {
     uint s0 = ((uint)ct[ 0]<<24)|((uint)ct[ 1]<<16)|((uint)ct[ 2]<<8)|ct[ 3];
     uint s1 = ((uint)ct[ 4]<<24)|((uint)ct[ 5]<<16)|((uint)ct[ 6]<<8)|ct[ 7];
     uint s2 = ((uint)ct[ 8]<<24)|((uint)ct[ 9]<<16)|((uint)ct[10]<<8)|ct[11];
@@ -279,17 +276,17 @@ void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const ucha
 
     uint t0,t1,t2,t3;
     for (int r = 13; r >= 1; r--) {
-        t0 = l_TD0[(s0>>24)&0xff]^l_TD1[(s3>>16)&0xff]^l_TD2[(s2>>8)&0xff]^l_TD3[s1&0xff]^rk[r*4+0];
-        t1 = l_TD0[(s1>>24)&0xff]^l_TD1[(s0>>16)&0xff]^l_TD2[(s3>>8)&0xff]^l_TD3[s2&0xff]^rk[r*4+1];
-        t2 = l_TD0[(s2>>24)&0xff]^l_TD1[(s1>>16)&0xff]^l_TD2[(s0>>8)&0xff]^l_TD3[s3&0xff]^rk[r*4+2];
-        t3 = l_TD0[(s3>>24)&0xff]^l_TD1[(s2>>16)&0xff]^l_TD2[(s1>>8)&0xff]^l_TD3[s0&0xff]^rk[r*4+3];
+        t0 = TD0[(s0>>24)&0xff]^TD1[(s3>>16)&0xff]^TD2[(s2>>8)&0xff]^TD3[s1&0xff]^rk[r*4+0];
+        t1 = TD0[(s1>>24)&0xff]^TD1[(s0>>16)&0xff]^TD2[(s3>>8)&0xff]^TD3[s2&0xff]^rk[r*4+1];
+        t2 = TD0[(s2>>24)&0xff]^TD1[(s1>>16)&0xff]^TD2[(s0>>8)&0xff]^TD3[s3&0xff]^rk[r*4+2];
+        t3 = TD0[(s3>>24)&0xff]^TD1[(s2>>16)&0xff]^TD2[(s1>>8)&0xff]^TD3[s0&0xff]^rk[r*4+3];
         s0=t0; s1=t1; s2=t2; s3=t3;
     }
     /* Final round: InvShiftRows + InvSubBytes (no InvMixColumns) */
-    t0 = ((uint)l_SBOX_INV[(s0>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s3>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s2>>8)&0xff]<<8)|l_SBOX_INV[s1&0xff];
-    t1 = ((uint)l_SBOX_INV[(s1>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s0>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s3>>8)&0xff]<<8)|l_SBOX_INV[s2&0xff];
-    t2 = ((uint)l_SBOX_INV[(s2>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s1>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s0>>8)&0xff]<<8)|l_SBOX_INV[s3&0xff];
-    t3 = ((uint)l_SBOX_INV[(s3>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s2>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s1>>8)&0xff]<<8)|l_SBOX_INV[s0&0xff];
+    t0 = ((uint)SBOX_INV[(s0>>24)&0xff]<<24)|((uint)SBOX_INV[(s3>>16)&0xff]<<16)|((uint)SBOX_INV[(s2>>8)&0xff]<<8)|SBOX_INV[s1&0xff];
+    t1 = ((uint)SBOX_INV[(s1>>24)&0xff]<<24)|((uint)SBOX_INV[(s0>>16)&0xff]<<16)|((uint)SBOX_INV[(s3>>8)&0xff]<<8)|SBOX_INV[s2&0xff];
+    t2 = ((uint)SBOX_INV[(s2>>24)&0xff]<<24)|((uint)SBOX_INV[(s1>>16)&0xff]<<16)|((uint)SBOX_INV[(s0>>8)&0xff]<<8)|SBOX_INV[s3&0xff];
+    t3 = ((uint)SBOX_INV[(s3>>24)&0xff]<<24)|((uint)SBOX_INV[(s2>>16)&0xff]<<16)|((uint)SBOX_INV[(s1>>8)&0xff]<<8)|SBOX_INV[s0&0xff];
 
     /* AddRoundKey (round 0) */
     t0^=rk[0]; t1^=rk[1]; t2^=rk[2]; t3^=rk[3];
@@ -337,27 +334,8 @@ __kernel void multibit_check(
     __global       uint  *found_idx,
     const          uint   pw_stride
 ) {
-    /* Copy lookup tables from constant to local (shared) memory.
-       All threads in the work-group cooperate; local reads are broadcast-friendly
-       and subsequent per-thread accesses avoid constant cache thrashing. */
-    __local uint  l_TD0[256], l_TD1[256], l_TD2[256], l_TD3[256];
-    __local uchar l_SBOX[256], l_SBOX_INV[256];
-    int lid   = (int)get_local_id(0);
-    int lsize = (int)get_local_size(0);
-    for (int i = lid; i < 256; i += lsize) {
-        l_TD0[i]      = TD0[i];
-        l_TD1[i]      = TD1[i];
-        l_TD2[i]      = TD2[i];
-        l_TD3[i]      = TD3[i];
-        l_SBOX[i]     = (uchar)SBOX[i];
-        l_SBOX_INV[i] = SBOX_INV[i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    /* Early exit: skip remaining work if another thread already found a match. */
-    if (found_idx[0]) return;
-
     uint gid = get_global_id(0);
+
     uint pw_len = pw_lens[gid];
     if (pw_len == 0) return;
 
@@ -396,11 +374,11 @@ __kernel void multibit_check(
 
     /* Expand key once; reuse for both AES blocks */
     uint rk[60];
-    aes256_key_expand(aes_key, rk, l_SBOX, l_TD0, l_TD1, l_TD2, l_TD3);
+    aes256_key_expand(aes_key, rk);
 
     /* Decrypt first AES block (IV = iv, CT = enc_local[0..15]) */
     uchar pt1[16];
-    aes256_block_decrypt(rk, iv, enc_local, pt1, l_TD0, l_TD1, l_TD2, l_TD3, l_SBOX_INV);
+    aes256_block_decrypt(rk, iv, enc_local, pt1);
 
     /* Quick check: first byte must be L, K, 5, or Q */
     uchar b0 = pt1[0];
@@ -411,7 +389,7 @@ __kernel void multibit_check(
 
     /* Decrypt second AES block (IV = first ciphertext block = enc_local[0..15]) */
     uchar pt2[16];
-    aes256_block_decrypt(rk, enc_local, enc_local + 16, pt2, l_TD0, l_TD1, l_TD2, l_TD3, l_SBOX_INV);
+    aes256_block_decrypt(rk, enc_local, enc_local + 16, pt2);
     if (!all_b58(pt2, 16)) return;
 
     /* Found! Record this work item's index (1-based) */
@@ -462,9 +440,8 @@ class WalletMultiBit:
 # OpenCL engine
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE   = 1048576  # GPU processes faster than CPU generates
+BATCH_SIZE   = 1048576  # 8x larger: GPU processes faster than CPU generates
 PW_STRIDE    = 128      # max password length in bytes
-LOCAL_SIZE   = 128      # OpenCL work-group size tuned for RTX 2060 (warp=32, 30 SMs)
 
 class GPUEngine:
     def __init__(self, wallet, batch_size=BATCH_SIZE):
@@ -484,35 +461,33 @@ class GPUEngine:
         self._kernel  = self._program.multibit_check
 
         mf = cl.mem_flags
-        enc_np  = np.frombuffer(wallet._enc,  dtype=np.uint8)
-        salt_np = np.frombuffer(wallet._salt, dtype=np.uint8)
+        enc_np   = np.frombuffer(wallet._enc,  dtype=np.uint8)
+        salt_np  = np.frombuffer(wallet._salt, dtype=np.uint8)
         self._enc_buf  = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=enc_np)
         self._salt_buf = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=salt_np)
 
-        # ALLOC_HOST_PTR pins the transfer buffer in page-locked host memory,
-        # allowing the DMA engine to move data without OS-level staging copies.
-        self._pw_buf    = cl.Buffer(self._ctx, mf.READ_ONLY  | mf.ALLOC_HOST_PTR, batch_size * PW_STRIDE)
-        self._len_buf   = cl.Buffer(self._ctx, mf.READ_ONLY  | mf.ALLOC_HOST_PTR, batch_size * 4)
+        self._pw_buf    = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * PW_STRIDE)
+        self._len_buf   = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * 4)
         self._found_buf = cl.Buffer(self._ctx, mf.READ_WRITE, 4)
         self._found_np  = np.zeros(1, dtype=np.uint32)
 
     def check_batch(self, passwords):
         """Check a list of password strings on the GPU.
         Returns the found password string, or None."""
-        n_actual = len(passwords)
-        stride   = PW_STRIDE
+        n = len(passwords)
+        stride = PW_STRIDE
 
-        # Pad global size to a multiple of LOCAL_SIZE (required for explicit local_size).
-        # Extra slots get pw_len=0 so the kernel ignores them.
-        n = ((n_actual + LOCAL_SIZE - 1) // LOCAL_SIZE) * LOCAL_SIZE
-
-        raw     = bytearray(n * stride)   # zero-filled; padded entries have len=0
+        # Fast packing: build into a bytearray (avoids per-row np.frombuffer calls)
+        raw = bytearray(n * stride)
         len_arr = np.zeros(n, dtype=np.uint32)
         for i, pw in enumerate(passwords):
-            pb = pw.encode("ascii", "ignore")
-            l  = min(len(pb), stride)
-            raw[i*stride : i*stride+l] = pb[:l]
-            len_arr[i] = l
+            pb = pw.encode("utf-8")
+            pw_len = len(pb)
+            if pw_len > stride:
+                pw_len = stride
+                pb = pb[:stride]
+            raw[i*stride : i*stride+pw_len] = pb
+            len_arr[i] = pw_len
 
         pw_np = np.frombuffer(raw, dtype=np.uint8)
         self._found_np[0] = 0
@@ -522,7 +497,7 @@ class GPUEngine:
         cl.enqueue_copy(self._queue, self._found_buf, self._found_np)
 
         self._kernel(
-            self._queue, (n,), (LOCAL_SIZE,),
+            self._queue, (n,), None,
             self._pw_buf, self._len_buf,
             self._salt_buf, self._enc_buf,
             self._found_buf,
@@ -532,11 +507,9 @@ class GPUEngine:
         self._queue.finish()
 
         if self._found_np[0]:
-            idx = self._found_np[0] - 1
-            if idx < n_actual:
-                candidate = passwords[idx]
-                if self._wallet.verify_cpu(candidate):
-                    return candidate
+            candidate = passwords[self._found_np[0] - 1]
+            if self._wallet.verify_cpu(candidate):
+                return candidate
         return None
 
 # ---------------------------------------------------------------------------
