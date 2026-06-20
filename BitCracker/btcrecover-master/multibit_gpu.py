@@ -254,11 +254,8 @@ __constant uchar SBOX_INV[256] = {
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 };
 
-/* AES-256 CBC decrypt a single 16-byte block, XOR with xor_block (IV or previous ciphertext) */
-void aes256_cbc_decrypt(const uchar *key32, const uchar *xor_block, const uchar *ct, uchar *pt) {
-    uint rk[60];
-    aes256_key_expand(key32, rk);
-
+/* AES-256 CBC decrypt a single 16-byte block given pre-expanded round keys */
+void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const uchar *ct, uchar *pt) {
     uint s0 = ((uint)ct[ 0]<<24)|((uint)ct[ 1]<<16)|((uint)ct[ 2]<<8)|ct[ 3];
     uint s1 = ((uint)ct[ 4]<<24)|((uint)ct[ 5]<<16)|((uint)ct[ 6]<<8)|ct[ 7];
     uint s2 = ((uint)ct[ 8]<<24)|((uint)ct[ 9]<<16)|((uint)ct[10]<<8)|ct[11];
@@ -364,9 +361,13 @@ __kernel void multibit_check(
     uchar enc_local[32];
     for (uint i = 0; i < 32; i++) enc_local[i] = enc[i];
 
+    /* Expand key once; reuse for both AES blocks */
+    uint rk[60];
+    aes256_key_expand(aes_key, rk);
+
     /* Decrypt first AES block (IV = iv, CT = enc_local[0..15]) */
     uchar pt1[16];
-    aes256_cbc_decrypt(aes_key, iv, enc_local, pt1);
+    aes256_block_decrypt(rk, iv, enc_local, pt1);
 
     /* Quick check: first byte must be L, K, 5, or Q */
     uchar b0 = pt1[0];
@@ -377,7 +378,7 @@ __kernel void multibit_check(
 
     /* Decrypt second AES block (IV = first ciphertext block = enc_local[0..15]) */
     uchar pt2[16];
-    aes256_cbc_decrypt(aes_key, enc_local, enc_local + 16, pt2);
+    aes256_block_decrypt(rk, enc_local, enc_local + 16, pt2);
     if (!all_b58(pt2, 16)) return;
 
     /* Found! Record this work item's index (1-based) */
@@ -409,7 +410,7 @@ class WalletMultiBit:
 
     def verify_cpu(self, password):
         """CPU verification for confirming a GPU hit."""
-        pw_bytes = password.encode("utf-16-le")[::2]
+        pw_bytes = password.encode("utf-8")
         salted = pw_bytes + self._salt
         key1 = hashlib.md5(salted).digest()
         key2 = hashlib.md5(key1 + salted).digest()
@@ -428,7 +429,7 @@ class WalletMultiBit:
 # OpenCL engine
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE   = 524288   # 8x larger: GPU processes faster than CPU generates
+BATCH_SIZE   = 1048576  # 8x larger: GPU processes faster than CPU generates
 PW_STRIDE    = 128      # max password length in bytes
 
 class GPUEngine:
@@ -469,7 +470,7 @@ class GPUEngine:
         raw = bytearray(n * stride)
         len_arr = np.zeros(n, dtype=np.uint32)
         for i, pw in enumerate(passwords):
-            pb = pw.encode("ascii", "ignore")
+            pb = pw.encode("utf-8")
             l = len(pb)
             if l > stride:
                 l = stride
