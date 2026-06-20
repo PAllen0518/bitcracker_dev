@@ -933,7 +933,7 @@ def main():
             return
 
         elapsed = time.time() - start_time
-        rate    = total / elapsed if elapsed > 0 else 0
+        rate    = (total - skip_count) / elapsed if elapsed > 0 else 0
         print(f"\r{total:>16,} passwords  {rate:>10,.0f}/s", end="", flush=True)
 
         if args.autosave and time.time() - last_save > 30:
@@ -941,7 +941,7 @@ def main():
             last_save = time.time()
 
     elapsed = time.time() - start_time
-    rate    = total / elapsed if elapsed > 0 else 0
+    rate    = (total - skip_count) / elapsed if elapsed > 0 else 0
     print(f"\nSearch complete. {total:,} passwords checked in {elapsed:.1f}s ({rate:,.0f}/s). Password not found.")
 
 if __name__ == "__main__":
