@@ -38,6 +38,11 @@ import sys, argparse, itertools, string, re, multiprocessing, signal, os, cPickl
 # The progressbar module is recommended but optional; it is typically
 # distributed with btcrecover (it is loaded later on demand)
 
+# Fast-restore globals: track the product combo position so --restore can
+# jump directly to the right combo using islice instead of counting passwords.
+_tokenlist_combo_idx  = 0  # updated by tokenlist_base_password_generator before each yield
+_restore_start_combo  = 0  # set by password_generator_factory when restoring from combo_idx
+
 
 def full_version():
     from struct import calcsize
@@ -4311,11 +4316,21 @@ def tokenlist_base_password_generator():
     # might be faster (possibly a lot) if a large --min-tokens or any --max-tokens
     # is specified at the command line, otherwise use the standard itertools version.
     using_product_limitedlen = l_args_min_tokens > 5 or l_args_max_tokens < sys.maxint
+    global _tokenlist_combo_idx
     if using_product_limitedlen:
         product_generator = product_limitedlen(*token_lists, minlen=l_args_min_tokens, maxlen=l_args_max_tokens)
     else:
         product_generator = itertools.product(*token_lists)
-    for tokens_combination in product_generator:
+
+    # Fast-forward to the saved combo position at C speed (only for itertools.product path)
+    _fast_start = _restore_start_combo if not using_product_limitedlen else 0
+    if _fast_start > 0:
+        print("Fast restore: advancing to combo {:,} in token list...".format(_fast_start), file=sys.stderr)
+        for _ in itertools.islice(product_generator, _fast_start):
+            pass
+
+    for _combo_idx, tokens_combination in enumerate(product_generator, start=_fast_start):
+        _tokenlist_combo_idx = _combo_idx  # update for autosave
 
         # Remove any None's, then check against token length constraints:
         # (product_limitedlen, if used, has already done all this)
@@ -5191,7 +5206,8 @@ def do_autosave(skip, inside_interrupt_handler = False):
         autosave_file.truncate()
         try:   os.fsync(autosave_file.fileno())
         except StandardError: pass
-    savestate[b"skip"] = skip  # overwrite the one item which changes for each autosave
+    savestate[b"skip"]      = skip                 # overwrite the one item which changes for each autosave
+    savestate[b"combo_idx"] = _tokenlist_combo_idx  # save combo position for fast restore
     cPickle.dump(savestate, autosave_file, cPickle.HIGHEST_PROTOCOL)
     assert autosave_file.tell() <= start_pos + SAVESLOT_SIZE, "do_autosave: data <= "+unicode(SAVESLOT_SIZE)+" bytes long"
     autosave_file.flush()
@@ -5220,6 +5236,15 @@ PASSWORDS_BETWEEN_UPDATES = 100000
 def password_generator_factory(chunksize = 1, est_secs_per_password = 0):
     # If est_secs_per_password is zero, only skipping is performed;
     # if est_secs_per_password is non-zero, all passwords (including skipped ones) are counted.
+
+    # Fast restore: if the save file includes a combo_idx, jump directly to that product
+    # combo using itertools.islice (C speed) instead of iterating through all skipped passwords.
+    # The generator starts from that combo; a small number of passwords at the combo boundary
+    # may be re-checked, which is harmless. Only used when skipping (not counting).
+    global _restore_start_combo
+    if not est_secs_per_password and savestate and b"combo_idx" in savestate and args.skip > 0:
+        _restore_start_combo = savestate[b"combo_idx"]
+        return password_generator(chunksize), args.skip
 
     # If not counting all passwords (if only skipping)
     if not est_secs_per_password:
