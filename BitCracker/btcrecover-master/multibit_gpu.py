@@ -11,8 +11,17 @@ Usage:
     python multibit_gpu.py --restore save.pkl
 """
 
-import sys, os, argparse, hashlib, base64, struct, pickle, time, itertools
-import string, re, collections, threading, queue as _queue
+import sys
+import argparse
+import hashlib
+import base64
+import pickle
+import time
+import itertools
+import string
+import re
+import threading
+import queue as _queue
 from math import factorial
 
 try:
@@ -54,10 +63,12 @@ def _build_td_tables():
     def gmul(a, b):
         p = 0
         for _ in range(8):
-            if b & 1: p ^= a
+            if b & 1:
+                p ^= a
             hi = a & 0x80
             a = ((a << 1) & 0xff)
-            if hi: a ^= 0x1b
+            if hi:
+                a ^= 0x1b
             b >>= 1
         return p
     def rotr8(x): return ((x >> 8) | (x << 24)) & 0xFFFFFFFF
@@ -471,12 +482,12 @@ class GPUEngine:
         len_arr = np.zeros(n, dtype=np.uint32)
         for i, pw in enumerate(passwords):
             pb = pw.encode("utf-8")
-            l = len(pb)
-            if l > stride:
-                l = stride
+            pw_len = len(pb)
+            if pw_len > stride:
+                pw_len = stride
                 pb = pb[:stride]
-            raw[i*stride : i*stride+l] = pb
-            len_arr[i] = l
+            raw[i*stride : i*stride+pw_len] = pb
+            len_arr[i] = pw_len
 
         pw_np = np.frombuffer(raw, dtype=np.uint8)
         self._found_np[0] = 0
@@ -510,7 +521,7 @@ class AnchoredToken:
     RELATIVE   = 2
     MIDDLE     = 3
 
-    def __init__(self, token, line_num="?"):
+    def __init__(self, token, line_num: int | str = "?"):
         if token.startswith("^"):
             m = re.match(r"\^(?:(?P<begin>\d+)?(?P<middle>,)(?P<end>\d+)?|(?P<rel>[rR])?(?P<pos>\d+))[\^$]", token)
             if m:
@@ -539,7 +550,7 @@ class AnchoredToken:
                 raise ValueError(f"line {line_num}: token has both ^ and $ anchors")
         elif token.endswith("$"):
             self.type = self.POSITIONAL
-            self.pos  = "$"
+            self.pos  = -1  # sentinel for end-anchor; resolved to n-1 at use
             self.text = token[:-1]
         else:
             raise ValueError("Not an anchored token")
@@ -648,9 +659,11 @@ def parse_tokenlist(filepath):
                         for et in expanded_texts:
                             at = AnchoredToken.__new__(AnchoredToken)
                             at.type = tok.type
-                            at.pos  = tok.pos if hasattr(tok, "pos") else None
-                            if hasattr(tok, "begin"): at.begin = tok.begin
-                            if hasattr(tok, "end"):   at.end   = tok.end
+                            at.pos  = tok.pos if hasattr(tok, "pos") else 0
+                            if hasattr(tok, "begin"):
+                                at.begin = tok.begin
+                            if hasattr(tok, "end"):
+                                at.end = tok.end
                             at.text  = et
                             at._str  = raw
                             at._hash = hash(raw)
@@ -681,7 +694,7 @@ def _assemble(ordered_tokens):
     for tok in ordered_tokens:
         if isinstance(tok, AnchoredToken):
             if tok.type == AnchoredToken.POSITIONAL:
-                pos = tok.pos if tok.pos != "$" else n - 1
+                pos = (n - 1) if tok.pos == -1 else tok.pos
                 if pos >= n or result[pos] is not None:
                     return None  # conflict
                 result[pos] = tok.text
@@ -699,8 +712,6 @@ def _assemble(ordered_tokens):
             return None
         if isinstance(tok, AnchoredToken):
             if tok.type == AnchoredToken.MIDDLE:
-                adj = sum(1 for r in result[:slot+1] if r is not None) + \
-                      sum(1 for f in free[:free.index(tok)] if not isinstance(f, AnchoredToken))
                 actual_pos = slot
                 if not (tok.begin <= actual_pos <= tok.end):
                     return None
@@ -712,7 +723,7 @@ def _assemble(ordered_tokens):
 
     if None in result:
         return None
-    return "".join(result)
+    return "".join(r for r in result if r is not None)
 
 
 def _count_combo_passwords(tokens):
@@ -725,7 +736,7 @@ def _count_combo_passwords(tokens):
     free_tokens = []
     for tok in tokens:
         if isinstance(tok, AnchoredToken) and tok.type == AnchoredToken.POSITIONAL:
-            pos = tok.pos if tok.pos != "$" else n - 1
+            pos = (n - 1) if tok.pos == -1 else tok.pos
             if pos in positional:
                 return 0  # conflict — combo produces nothing
             positional[pos] = tok.text
@@ -786,7 +797,7 @@ def password_generator(token_lists, start_combo=0, skip_in_combo=0):
         skip = False
         for tok in tokens:
             if isinstance(tok, AnchoredToken) and tok.type == AnchoredToken.POSITIONAL:
-                pos = tok.pos if tok.pos != "$" else n - 1
+                pos = (n - 1) if tok.pos == -1 else tok.pos
                 if pos in positional:
                     skip = True
                     break
@@ -812,7 +823,7 @@ def password_generator(token_lists, start_combo=0, skip_in_combo=0):
                 if first_combo and pw_in_combo < skip_in_combo:
                     pw_in_combo += 1
                     continue
-                yield combo_idx, pw_in_combo, "".join(result)
+                yield combo_idx, pw_in_combo, "".join(r for r in result if r is not None)
                 pw_in_combo += 1
 
 # ---------------------------------------------------------------------------
