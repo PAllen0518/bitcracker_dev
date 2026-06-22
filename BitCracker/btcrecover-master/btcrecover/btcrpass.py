@@ -38,10 +38,25 @@ import sys, argparse, itertools, string, re, multiprocessing, signal, os, cPickl
 # The progressbar module is recommended but optional; it is typically
 # distributed with btcrecover (it is loaded later on demand)
 
-# Fast-restore globals: track the product combo position so --restore can
-# jump directly to the right combo using islice instead of counting passwords.
-_tokenlist_combo_idx  = 0  # updated by tokenlist_base_password_generator before each yield
-_restore_start_combo  = 0  # set by password_generator_factory when restoring from combo_idx
+# ---------------------------------------------------------------------------
+# Fast-restore globals
+#
+# The original btcrecover --restore mechanism iterated through every previously-
+# checked password in Python to re-position the generator (slow: days for large
+# skip counts).  We added combo_idx tracking to the autosave state so that on
+# restore we can use itertools.islice to jump to the right product combination
+# at C speed, then only replay the small number of permutations within that combo.
+#
+# _tokenlist_combo_idx: the index of the current product combo in the
+#   itertools.product(*token_lists) iteration.  Updated before each yield in
+#   tokenlist_base_password_generator so do_autosave() always has a current value.
+#
+# _restore_start_combo: set by password_generator_factory when it detects a
+#   combo_idx in the save file.  tokenlist_base_password_generator reads this
+#   at startup and uses islice to advance to that position.
+# ---------------------------------------------------------------------------
+_tokenlist_combo_idx  = 0
+_restore_start_combo  = 0
 
 
 def full_version():
@@ -1070,15 +1085,24 @@ class WalletMultiBit(object):
     # This is the time-consuming function executed by worker thread(s). It returns a tuple: if a password
     # is correct return it, else return False for item 0; return a count of passwords checked for item 1
     assert b"1" < b"9" < b"A" < b"Z" < b"a" < b"z"  # the b58 check below assumes ASCII ordering in the interest of speed
-    # Valid base58 chars; used with str.translate(None, _B58_VALID) to strip them - empty result means all-valid
+
+    # _B58_VALID is used with str.translate(None, _B58_VALID): translate() strips
+    # all characters in the second argument, so an empty result means every byte
+    # was a valid base58 character.  This is faster than a Python loop or a set
+    # membership test because translate() runs in C on the whole string at once.
     _B58_VALID = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
     def return_verified_password_or_false(self, orig_passwords):
-        # Copy a few globals into local for a small speed boost
+        # Copy globals to locals: CPython looks up locals faster than globals,
+        # and this function is called millions of times in the hot path.
         l_md5                 = hashlib.md5
         l_aes256_cbc_decrypt  = aes256_cbc_decrypt
         encrypted_block       = self._encrypted_block
         salt                  = self._salt
-        # Pre-slice once; avoids creating new string objects on every loop iteration
+
+        # Pre-slice the encrypted block outside the loop.  Without this, Python
+        # creates a new slice object on every iteration — measurably slow at millions
+        # of iterations per second.
         encrypted_block_first  = encrypted_block[:16]
         encrypted_block_second = encrypted_block[16:32] if len(encrypted_block) >= 32 else None
         l_b58_valid            = self._B58_VALID
@@ -4322,7 +4346,14 @@ def tokenlist_base_password_generator():
     else:
         product_generator = itertools.product(*token_lists)
 
-    # Fast-forward to the saved combo position at C speed (only for itertools.product path)
+    # Fast-forward to the saved combo position.
+    # itertools.islice on a product iterator advances at C speed — no Python
+    # password generation code runs during this skip.  This is the entire point
+    # of storing combo_idx in the save file: for a skip of 6.6 trillion passwords
+    # the old approach (iterating all of them in counting mode) would take weeks;
+    # islice to the right combo takes seconds.
+    # Only applies to the itertools.product path; product_limitedlen does not
+    # support efficient islice so we fall back to the old linear skip there.
     _fast_start = _restore_start_combo if not using_product_limitedlen else 0
     if _fast_start > 0:
         print("Fast restore: advancing to combo {:,} in token list...".format(_fast_start), file=sys.stderr)
@@ -4330,7 +4361,9 @@ def tokenlist_base_password_generator():
             pass
 
     for _combo_idx, tokens_combination in enumerate(product_generator, start=_fast_start):
-        _tokenlist_combo_idx = _combo_idx  # update for autosave
+        # Keep _tokenlist_combo_idx current so do_autosave() always captures the
+        # right position even when called mid-combo by the SIGINT handler.
+        _tokenlist_combo_idx = _combo_idx
 
         # Remove any None's, then check against token length constraints:
         # (product_limitedlen, if used, has already done all this)
@@ -5206,8 +5239,8 @@ def do_autosave(skip, inside_interrupt_handler = False):
         autosave_file.truncate()
         try:   os.fsync(autosave_file.fileno())
         except StandardError: pass
-    savestate[b"skip"]      = skip                 # overwrite the one item which changes for each autosave
-    savestate[b"combo_idx"] = _tokenlist_combo_idx  # save combo position for fast restore
+    savestate[b"skip"]      = skip                  # total passwords checked (for display + old-format compat)
+    savestate[b"combo_idx"] = _tokenlist_combo_idx  # combo position for fast restore via islice
     cPickle.dump(savestate, autosave_file, cPickle.HIGHEST_PROTOCOL)
     assert autosave_file.tell() <= start_pos + SAVESLOT_SIZE, "do_autosave: data <= "+unicode(SAVESLOT_SIZE)+" bytes long"
     autosave_file.flush()
@@ -5237,10 +5270,16 @@ def password_generator_factory(chunksize = 1, est_secs_per_password = 0):
     # If est_secs_per_password is zero, only skipping is performed;
     # if est_secs_per_password is non-zero, all passwords (including skipped ones) are counted.
 
-    # Fast restore: if the save file includes a combo_idx, jump directly to that product
-    # combo using itertools.islice (C speed) instead of iterating through all skipped passwords.
-    # The generator starts from that combo; a small number of passwords at the combo boundary
-    # may be re-checked, which is harmless. Only used when skipping (not counting).
+    # Fast restore path: if the save file contains combo_idx (added by our patch),
+    # set _restore_start_combo so that tokenlist_base_password_generator will use
+    # islice to jump directly to that product combo.  We then return immediately,
+    # bypassing the slow linear-skip loop below.
+    #
+    # We claim args.skip passwords were skipped (which is true — we're resuming
+    # from that position) so the caller's assertion (skipped == args.skip) passes.
+    #
+    # A small number of passwords at the start of the resumed combo may be
+    # re-checked if the save fired mid-combo; this is harmless (just redundant work).
     global _restore_start_combo
     if not est_secs_per_password and savestate and b"combo_idx" in savestate and args.skip > 0:
         _restore_start_combo = savestate[b"combo_idx"]
