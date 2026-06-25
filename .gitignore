@@ -18,3 +18,9 @@ Allan Search Notes*.txt
 # Autosave/restore files from btcrecover and GPU recovery runs
 savefile*
 *.pkl
+# CUDA Build Artifacts
+*.exe
+*.bin
+*.obj
+cl_intercept.log
+nvcc_*.txt
