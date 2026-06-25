@@ -1,19 +1,28 @@
 /*
  * multibit_cuda_threads.cu  -  C++ host generation + CUDA GPU checking
  *
- * Architecture (why this is faster than multibit_cuda.cu):
- *   multibit_cuda.cu used GPU-side permutation generation via nth_permutation,
- *   which has O(n^2) complexity and causes thread divergence.  This version
- *   generates passwords on the CPU in C++ using std::next_permutation, which
- *   runs at ~100-500M passwords/sec (vs Python's ~500K/sec).  The GPU only
- *   does what it is uniquely good at: the MD5+AES+base58 crypto check.
+ * Measured throughput (RTX 2060, search46.txt):
+ *   Python + OpenCL (multibit_gpu.py)  :   ~500K passwords/sec  (CPU bottleneck)
+ *   CUDA GPU-side gen (multibit_cuda.cu):   ~277K passwords/sec  (nth_permutation overhead)
+ *   This file, with std::string assembly :  ~3M   passwords/sec
+ *   This file, with char array assembly  :  ~11M  passwords/sec  <-- current
  *
- *   A background thread generates passwords and packs them into batches while
- *   the main thread simultaneously runs the GPU kernel on the previous batch.
- *   This fully overlaps CPU generation with GPU computation.
+ * Architecture:
+ *   multibit_cuda.cu generated passwords on the GPU using nth_permutation — O(n^2)
+ *   with thread divergence, making it slower than Python.  This version generates
+ *   on the CPU in C++ using std::next_permutation (O(n) per step, no divergence)
+ *   and sends complete password strings to the GPU for the crypto check only.
+ *
+ *   The initial C++ version used std::string and std::vector in the hot loop,
+ *   which caused a heap allocation per password.  Replacing these with stack-
+ *   allocated char arrays (assemble_password_fast) eliminated the allocation
+ *   overhead and raised throughput from 3M to 11M passwords/sec.
+ *
+ *   A background producer thread fills batches while the main thread runs the
+ *   GPU kernel, fully overlapping CPU generation with GPU computation.
  *
  * Compile:
- *   build_cuda.bat  (or see build_cuda.bat for the exact nvcc flags)
+ *   build_cuda.bat
  *
  * Usage:
  *   multibit_cuda_threads.exe --wallet multi.key --tokenlist search46.txt --autosave save.bin

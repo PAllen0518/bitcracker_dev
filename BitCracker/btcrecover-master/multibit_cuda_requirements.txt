@@ -1,5 +1,5 @@
-multibit_cuda.exe — Build Requirements
-=======================================
+multibit_cuda_threads.exe — Build Requirements
+===============================================
 
 CUDA Toolkit
   Version : 13.0 (built Jul 16 2025)
@@ -9,33 +9,43 @@ CUDA Toolkit
 GPU
   Tested on : NVIDIA GeForce RTX 2060 (compute capability sm_75)
   Driver    : 580.97 or later (must support CUDA 13.0)
+  Throughput: ~11M passwords/sec on search46.txt
 
 Host Compiler
   Visual Studio 2022 Build Tools v17.14 (MSVC 14.44)
-  NOTE: VS 2026 (MSVC 19.51+) is NOT supported by CUDA 13.0
+  IMPORTANT: VS 2026 (MSVC 19.51+) is NOT supported by CUDA 13.0
   Download: https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
   Component required: "Desktop development with C++"
 
 Windows SDK
   Version : 10.0.22621.0 (Windows 11 22H2)
   Install via VS installer > Individual components > "Windows 11 SDK (10.0.22621.0)"
-  NOTE: SDK 10.0.26100.0 (Windows 11 24H2) causes "Host compiler targets unsupported OS"
+  NOTE: SDK 10.0.26100.0 causes "Host compiler targets unsupported OS" error
 
 Known Build Issues
-  1. Username with spaces (e.g. "Paul Allen") causes nvcc to generate temp file paths
-     with unquoted spaces, breaking cl.exe. Fix: set TEMP=C:\Temp before compiling.
+  1. Username with spaces (e.g. "Paul Allen") causes nvcc to generate temp file
+     paths without quotes, which breaks cl.exe.
+     Fix: set TEMP=C:\Temp and TMP=C:\Temp before compiling (done in build_cuda.bat).
 
-  2. CUDA_PATH must be set explicitly if the system variable was not set by the installer.
+  2. CUDA 13.0 does not support VS 2026 (MSVC 19.51). Must use VS 2022.
 
-Build Command (run build_cuda.bat from the btcrecover-master directory)
-  build_cuda.bat
+  3. If multibit_cuda_threads.exe is running, the linker cannot overwrite it.
+     Stop the process before rebuilding.
 
-  Contents of build_cuda.bat:
-    call "...VS 2022...\vcvars64.bat"
-    set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
-    set PATH=%PATH%;%CUDA_PATH%\bin;%CUDA_PATH%\nvvm\bin
-    set TEMP=C:\Temp
-    set TMP=C:\Temp
-    nvcc multibit_cuda.cu -o multibit_cuda.exe -O3 -arch=sm_75
-         --compiler-bindir "...VS 2022...\bin\Hostx64\x64"
-         --allow-unsupported-compiler
+  4. If PATH contains CUDA v12.9 before v13.0, the wrong nvcc may be used.
+     build_cuda.bat uses the full path to nvcc.exe to avoid this.
+
+  5. VS 2022 Build Tools + CUDA 13.0 requires --allow-unsupported-compiler
+     because the host_config.h version check in CUDA 13.0 is conservative.
+     This is safe: MSVC 14.44 is fully compatible in practice.
+
+Build Command
+  Run build_cuda.bat from the btcrecover-master directory.
+  This builds both multibit_cuda.exe and multibit_cuda_threads.exe.
+
+  Key flags used:
+    -arch=sm_75                    RTX 2060 compute capability
+    --allow-unsupported-compiler   bypass conservative MSVC version check
+    --compiler-bindir <VS2022 path>  use VS 2022 cl.exe, not VS 2026
+    -std=c++14                     required for std::thread, lambdas
+    -O3                            full optimisation
