@@ -296,6 +296,18 @@ __device__ bool check_multibit(const uint8_t* pw, int pw_len) {
 //   Maps integer perm_idx in [0, n!) to a unique ordering of [0..n-1].
 // ---------------------------------------------------------------------------
 
+/*
+ * nth_permutation: maps a 64-bit index to the unique ordering of [0..n-1]
+ * using the factoradic (factorial number system).
+ *
+ * idx=0 gives [0,1,2,...,n-1], idx=n!-1 gives [n-1,...,1,0].
+ * This lets each GPU thread compute its permutation directly from its
+ * thread index without communicating with other threads.
+ *
+ * Algorithm: decompose idx in the factorial number system — each digit
+ * selects which remaining element to place next.  O(n^2) per call.
+ * For n <= 9 (our max) this is 45 inner iterations: negligible vs AES.
+ */
 __device__ void nth_permutation(int* perm, int n, uint64_t idx) {
     bool used[MAX_FREE_TOKENS] = {false};
     uint64_t f = 1;
@@ -583,6 +595,12 @@ static void parse_tokenlist(const char* path, TokenListLine* lines, int* n_lines
 // Host: count total product combos (for progress reporting)
 // ---------------------------------------------------------------------------
 
+/*
+ * count_combos: total number of entries in the Cartesian product of all
+ * token list lines.  This is the outer loop count (combos, not passwords) —
+ * each combo may produce multiple passwords via permutation.
+ * Used only for progress display and save/restore.
+ */
 static uint64_t count_combos(const TokenListLine* lines, int n_lines) {
     uint64_t total = 1;
     for (int i = 0; i < n_lines; i++) {
@@ -609,6 +627,19 @@ static uint64_t count_combos(const TokenListLine* lines, int n_lines) {
 
 // choice[i] = -1 means None (skip), else index into tokens[]
 // For digit wildcard: choice = digit string index (0=None,1="",2="0",...,11112="9999")
+/*
+ * decode_combo: mixed-radix decode of combo_idx into per-line token choices.
+ *
+ * The combo_idx is like a number in a mixed-radix system where each "digit"
+ * selects one token from one line.  Repeatedly dividing by the line size
+ * and taking the remainder extracts each digit in O(n_lines) time — the
+ * same O(1)-per-digit property that lets you decode a decimal number.
+ *
+ * choices[i] = -1 means the optional line i was skipped (None selected).
+ * choices[i] >= 0 is the index into lines[i].tokens[].
+ * For digit wildcard lines: choices[i] is the digit string index passed to
+ * digit_idx_to_str().
+ */
 static void decode_combo(uint64_t combo_idx,
                          const TokenListLine* lines, int n_lines,
                          int* choices) {
@@ -642,6 +673,19 @@ static void decode_combo(uint64_t combo_idx,
 //   idx 1111-11110: "0000"-"9999"
 // ---------------------------------------------------------------------------
 
+/*
+ * digit_idx_to_str: converts a digit-line choice index to the actual string.
+ *
+ * The %0,4d wildcard expands to 11,111 strings (empty + 1-4 digit numbers).
+ * We encode them as a single integer rather than storing 11,111 strings in
+ * the ComboTask struct.  Encoding:
+ *   0        -> None (skip this line — handled before calling this)
+ *   1        -> "" (zero-digit, empty string)
+ *   2-11     -> "0"-"9"  (1 digit)
+ *   12-111   -> "00"-"99" (2 digits)
+ *   112-1111 -> "000"-"999" (3 digits)
+ *   1112-11111 -> "0000"-"9999" (4 digits)
+ */
 static void digit_idx_to_str(int idx, char* out) {
     if (idx <= 0) { out[0]=0; return; }
     idx--;  // now 0-based into the actual strings

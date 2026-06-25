@@ -1,0 +1,41 @@
+multibit_cuda.exe — Build Requirements
+=======================================
+
+CUDA Toolkit
+  Version : 13.0 (built Jul 16 2025)
+  Path    : C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
+  Download: https://developer.nvidia.com/cuda-downloads
+
+GPU
+  Tested on : NVIDIA GeForce RTX 2060 (compute capability sm_75)
+  Driver    : 580.97 or later (must support CUDA 13.0)
+
+Host Compiler
+  Visual Studio 2022 Build Tools v17.14 (MSVC 14.44)
+  NOTE: VS 2026 (MSVC 19.51+) is NOT supported by CUDA 13.0
+  Download: https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
+  Component required: "Desktop development with C++"
+
+Windows SDK
+  Version : 10.0.22621.0 (Windows 11 22H2)
+  Install via VS installer > Individual components > "Windows 11 SDK (10.0.22621.0)"
+  NOTE: SDK 10.0.26100.0 (Windows 11 24H2) causes "Host compiler targets unsupported OS"
+
+Known Build Issues
+  1. Username with spaces (e.g. "Paul Allen") causes nvcc to generate temp file paths
+     with unquoted spaces, breaking cl.exe. Fix: set TEMP=C:\Temp before compiling.
+
+  2. CUDA_PATH must be set explicitly if the system variable was not set by the installer.
+
+Build Command (run build_cuda.bat from the btcrecover-master directory)
+  build_cuda.bat
+
+  Contents of build_cuda.bat:
+    call "...VS 2022...\vcvars64.bat"
+    set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
+    set PATH=%PATH%;%CUDA_PATH%\bin;%CUDA_PATH%\nvvm\bin
+    set TEMP=C:\Temp
+    set TMP=C:\Temp
+    nvcc multibit_cuda.cu -o multibit_cuda.exe -O3 -arch=sm_75
+         --compiler-bindir "...VS 2022...\bin\Hostx64\x64"
+         --allow-unsupported-compiler
