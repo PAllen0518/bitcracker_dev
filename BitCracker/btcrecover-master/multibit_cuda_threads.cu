@@ -39,12 +39,9 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <numeric>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
-#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Configuration
