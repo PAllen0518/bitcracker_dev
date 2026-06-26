@@ -32,6 +32,8 @@ import re
 import threading
 import queue as _queue
 from math import factorial
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
 try:
     import pyopencl as cl
@@ -521,19 +523,22 @@ class WalletMultiBit:
         self._salt  = salt             # 8 bytes
 
     @classmethod
-    def load(cls, filename):
+    def load(cls, filename: str) -> "WalletMultiBit":
         with open(filename, "r") as f:
             raw = f.read(70)
         data = b"".join(raw.encode("ascii").split())
         if len(data) < 64:
             raise ValueError("MultiBit key file too short")
         data = base64.b64decode(data[:64])
-        assert data[:8] == b"Salted__", "Not a MultiBit key file"
+        # assert replaced with explicit check: assert is silently disabled
+        # by the Python -O flag, making it unreliable as an error guard.
+        if data[:8] != b"Salted__":
+            raise ValueError("Not a MultiBit key file (missing 'Salted__' header)")
         if len(data) < 48:
             raise ValueError("MultiBit key file decodes to less than 48 bytes")
         return cls(encrypted_block=data[16:48], salt=data[8:16])
 
-    def verify_cpu(self, password):
+    def verify_cpu(self, password: str) -> bool:
         """CPU re-verification of a GPU hit before reporting it as found.
         The GPU uses atomic_cmpxchg which can in theory store a false positive
         (e.g. a base58 collision); this CPU check is the authoritative test."""
@@ -577,7 +582,9 @@ class GPUEngine:
         for p in platforms:
             gpu_devices += p.get_devices(cl.device_type.GPU)
         if not gpu_devices:
-            sys.exit("No OpenCL GPU devices found.")
+            # Raise instead of sys.exit: constructors should not terminate
+            # the process; let the caller decide how to handle missing hardware.
+            raise RuntimeError("No OpenCL GPU devices found.")
         self._device  = gpu_devices[0]
         print(f"Using GPU: {self._device.name.strip()}")
         self._ctx     = cl.Context([self._device])
@@ -603,7 +610,17 @@ class GPUEngine:
         self._found_buf = cl.Buffer(self._ctx, mf.READ_WRITE, 4)
         self._found_np  = np.zeros(1, dtype=np.uint32)
 
-    def check_batch(self, passwords):
+    # Context manager support (RAII equivalent): ensures GPU buffers are
+    # released even if an exception occurs, rather than relying on GC.
+    def __enter__(self) -> "GPUEngine":
+        return self
+
+    def __exit__(self, *_) -> None:
+        for buf in (self._pw_buf, self._len_buf, self._found_buf,
+                    self._enc_buf, self._salt_buf):
+            buf.release()
+
+    def check_batch(self, passwords: List[str]) -> Optional[str]:
         """Check a list of password strings on the GPU.
         Returns the found password string, or None."""
         n = len(passwords)
@@ -616,7 +633,10 @@ class GPUEngine:
         raw = bytearray(n * stride)
         len_arr = np.zeros(n, dtype=np.uint32)
         for i, pw in enumerate(passwords):
-            pb = pw.encode("utf-8")
+            # ascii not utf-8: passwords are always ASCII; utf-8 adds
+            # unnecessary overhead and can produce multi-byte sequences
+            # for non-ASCII chars that the kernel doesn't expect.
+            pb = pw.encode("ascii", "ignore")
             pw_len = len(pb)
             if pw_len > stride:
                 pw_len = stride
@@ -1000,6 +1020,11 @@ def password_generator(token_lists, start_combo=0, skip_in_combo=0):
 # ---------------------------------------------------------------------------
 # Save / restore
 #
+# SaveState is a dataclass rather than a raw dict so that:
+#   - Fields are named and typed (interface clarity, C++ Core Guidelines I.4)
+#   - Accidental typos in key names are caught at definition time
+#   - The structure is self-documenting
+#
 # We save combo_idx + perm_idx alongside the plain password count (skip_count).
 # skip_count is kept for display purposes and backward compatibility with old
 # saves that lack combo_idx.  combo_idx + perm_idx is what makes restoration
@@ -1010,20 +1035,39 @@ def password_generator(token_lists, start_combo=0, skip_in_combo=0):
 # on an ungraceful exit (Ctrl+C during a kernel call, power loss, etc.).
 # ---------------------------------------------------------------------------
 
-def save_state(path, skip_count, combo_idx, perm_idx, tokenlist_path, wallet_path):
-    state = {
-        "skip":      skip_count,
-        "combo_idx": combo_idx,
-        "perm_idx":  perm_idx,
-        "tokenlist": tokenlist_path,
-        "wallet":    wallet_path,
-    }
+@dataclass
+class SaveState:
+    skip:      int
+    combo_idx: int
+    perm_idx:  int
+    tokenlist: str
+    wallet:    str
+
+def save_state(path: str, skip_count: int, combo_idx: int, perm_idx: int,
+               tokenlist_path: str, wallet_path: str) -> None:
+    state = SaveState(
+        skip      = skip_count,
+        combo_idx = combo_idx,
+        perm_idx  = perm_idx,
+        tokenlist = tokenlist_path,
+        wallet    = wallet_path,
+    )
     with open(path, "wb") as f:
         pickle.dump(state, f)
 
-def load_state(path):
+def load_state(path: str) -> SaveState:
     with open(path, "rb") as f:
-        return pickle.load(f)
+        raw = pickle.load(f)
+    # Handle old dict-format saves (before SaveState dataclass was introduced)
+    if isinstance(raw, dict):
+        return SaveState(
+            skip      = raw.get("skip", 0),
+            combo_idx = raw.get("combo_idx", 0),
+            perm_idx  = raw.get("perm_idx",  0),
+            tokenlist = raw.get("tokenlist", ""),
+            wallet    = raw.get("wallet",    ""),
+        )
+    return raw
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1071,12 +1115,12 @@ def main():
     start_perm     = 0
 
     if args.restore:
-        state = load_state(args.restore)
-        skip_count     = state["skip"]
-        tokenlist_path = state["tokenlist"]
-        wallet_path    = state["wallet"]
-        start_combo    = state.get("combo_idx")   # None if old-format save
-        start_perm     = state.get("perm_idx", 0)
+        state          = load_state(args.restore)  # returns SaveState dataclass
+        skip_count     = state.skip
+        tokenlist_path = state.tokenlist
+        wallet_path    = state.wallet
+        start_combo    = state.combo_idx or None   # 0 treated as "not set" for migration
+        start_perm     = state.perm_idx
         print(f"Restored from {args.restore}, resuming at password #{skip_count:,}")
 
     if not wallet_path or not tokenlist_path:
@@ -1085,7 +1129,18 @@ def main():
     wallet      = WalletMultiBit.load(wallet_path)
     token_lists = parse_tokenlist(tokenlist_path)
     batch_size  = args.batch_size
-    engine      = GPUEngine(wallet, batch_size)
+
+    # 'with' ensures GPU buffers are released even if an exception occurs,
+    # rather than relying on the garbage collector to eventually call __del__.
+    with GPUEngine(wallet, batch_size) as engine:
+      _run_search(engine, args, token_lists, wallet_path, tokenlist_path,
+                  skip_count, start_combo, start_perm)
+
+
+def _run_search(engine, args, token_lists, wallet_path, tokenlist_path,
+                skip_count, start_combo, start_perm):
+    """Inner search loop, separated so GPUEngine 'with' block is clean."""
+    batch_size = engine._batch_size
 
     # Old save files only store skip_count, not combo_idx.
     # Run a fast counting pass (no string building) to locate the combo position.
