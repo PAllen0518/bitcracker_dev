@@ -1,4 +1,9 @@
-CLAUDE
+# Settings
+.clangd
+*_properties.json
+settings.json
+
+# CLAUDE
 .claude
 *.pyc
 *.pyo
