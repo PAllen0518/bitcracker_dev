@@ -4356,9 +4356,25 @@ def tokenlist_base_password_generator():
     # support efficient islice so we fall back to the old linear skip there.
     _fast_start = _restore_start_combo if not using_product_limitedlen else 0
     if _fast_start > 0:
-        print("Fast restore: advancing to combo {:,} in token list...".format(_fast_start), file=sys.stderr)
-        for _ in itertools.islice(product_generator, _fast_start):
-            pass
+        print("Fast restore: advancing to combo {:,} in token list...".format(_fast_start),
+              file=sys.stderr)
+        # Count how many combos we actually skip.  If fewer than _fast_start
+        # are available the iterator is exhausted, meaning the save file was
+        # created with a different (larger) token list — warn and continue
+        # from the start rather than silently producing no passwords.
+        skipped = sum(1 for _ in itertools.islice(product_generator, _fast_start))
+        if skipped < _fast_start:
+            print(prog + ": warning: token list is smaller than the saved combo_idx "
+                  "({:,} combos available, {:,} expected). Starting from the beginning.".format(
+                      skipped, _fast_start),
+                  file=sys.stderr)
+            # Re-create the product generator from scratch
+            if using_product_limitedlen:
+                product_generator = product_limitedlen(
+                    *token_lists, minlen=l_args_min_tokens, maxlen=l_args_max_tokens)
+            else:
+                product_generator = itertools.product(*token_lists)
+            _fast_start = 0
 
     for _combo_idx, tokens_combination in enumerate(product_generator, start=_fast_start):
         # Keep _tokenlist_combo_idx current so do_autosave() always captures the
@@ -5282,8 +5298,16 @@ def password_generator_factory(chunksize = 1, est_secs_per_password = 0):
     # re-checked if the save fired mid-combo; this is harmless (just redundant work).
     global _restore_start_combo
     if not est_secs_per_password and savestate and b"combo_idx" in savestate and args.skip > 0:
-        _restore_start_combo = savestate[b"combo_idx"]
-        return password_generator(chunksize), args.skip
+        combo_idx = savestate[b"combo_idx"]
+        # Validate before use: a negative or impossibly large combo_idx
+        # (e.g. from a save file paired with a different token list) would
+        # silently exhaust the iterator, producing no passwords at all.
+        if not isinstance(combo_idx, (int, long)) or combo_idx < 0:
+            print(prog + ": warning: saved combo_idx is invalid, falling back to slow skip",
+                  file=sys.stderr)
+        else:
+            _restore_start_combo = combo_idx
+            return password_generator(chunksize), args.skip
 
     # If not counting all passwords (if only skipping)
     if not est_secs_per_password:
