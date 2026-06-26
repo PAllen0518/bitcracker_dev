@@ -39,9 +39,16 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+
+using hrclock     = std::chrono::steady_clock;
+using hrtimepoint = hrclock::time_point;
+static inline double secs_since(hrtimepoint t0) {
+    return std::chrono::duration<double>(hrclock::now() - t0).count();
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -852,9 +859,11 @@ int main(int argc, char** argv) {
     GPUEngine gpu;
     std::thread producer(producer_thread, &ps, state.passwords_checked);
 
-    time_t start_time = time(nullptr);
-    time_t last_save  = start_time;
-    uint64_t pw_checked = state.passwords_checked;
+    hrtimepoint start_time    = hrclock::now();
+    hrtimepoint last_save_tp  = start_time;
+    uint64_t pw_checked       = state.passwords_checked;
+    uint64_t pw_session_base  = state.passwords_checked;   // historical total at session start
+    uint64_t start_combo_idx  = state.combo_idx;
 
     printf("Starting at combo #%llu  (batch size %d)\n",
            (unsigned long long)state.combo_idx, BATCH_SIZE);
@@ -898,12 +907,18 @@ int main(int argc, char** argv) {
         state.passwords_checked = pw_checked;
         delete batch;
 
-        // Progress with adaptive units and ETA
-        time_t now = time(nullptr);
-        double elapsed  = difftime(now, start_time);
-        double rate     = elapsed > 0 ? pw_checked / elapsed : 0;
-        double frac     = total_combos > 0 ? (double)state.combo_idx / total_combos : 0;
-        double eta_secs = (frac > 0.0001 && elapsed > 0) ? elapsed * (1.0 - frac) / frac : 0;
+        // Progress: rate and ETA based on THIS SESSION only so a restored
+        // run shows true current throughput, not inflated by historical totals.
+        double elapsed        = secs_since(start_time);   // high-res, sub-second
+        uint64_t session_pw   = pw_checked - pw_session_base;
+        double rate           = elapsed > 1.0 ? (double)session_pw / elapsed : 0.0;
+        uint64_t session_cb   = state.combo_idx - start_combo_idx;
+        double combo_rate     = (elapsed > 1.0 && session_cb > 0)
+                                    ? (double)session_cb / elapsed : 0.0;
+        double remaining_cb   = (double)(total_combos - state.combo_idx);
+        double eta_secs       = combo_rate > 0 ? remaining_cb / combo_rate : 0.0;
+        double frac           = total_combos > 0
+                                    ? (double)state.combo_idx / total_combos : 0.0;
         char pw_buf[32], rate_buf[32], eta_buf[32];
         printf("\r%12s passwords  %9s/s  %.1f%%  ETA %s",
                fmt_count((double)pw_checked, pw_buf),
@@ -912,22 +927,21 @@ int main(int argc, char** argv) {
                fmt_eta(eta_secs, eta_buf));
         fflush(stdout);
 
-        if (autosave_path && difftime(now, last_save) >= 30.0) {
+        if (autosave_path && secs_since(last_save_tp) >= 30.0) {
             save_progress(autosave_path, state);
-            last_save = now;
+            last_save_tp = hrclock::now();
         }
     }
 
     producer.join();
 
     if (state.combo_idx >= total_combos) {
-        time_t now = time(nullptr);
-        double elapsed = difftime(now, start_time);
+        double elapsed = secs_since(start_time);
         char pw_buf[32], rate_buf[32];
         printf("\nSearch complete. %s passwords in %.0fs (%s/s). Not found.\n",
                fmt_count((double)pw_checked, pw_buf),
                elapsed,
-               fmt_count(elapsed > 0 ? pw_checked / elapsed : 0, rate_buf));
+               fmt_count(elapsed > 0 ? (double)pw_checked / elapsed : 0, rate_buf));
     }
     return 0;
 }
