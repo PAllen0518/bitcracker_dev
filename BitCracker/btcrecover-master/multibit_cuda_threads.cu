@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -51,11 +52,41 @@ static inline double secs_since(hrtimepoint t0) {
 }
 
 // ---------------------------------------------------------------------------
+// CUDA error checking (C++ Core Guidelines I.10: signal every failure)
+//
+// Every CUDA API call returns an error code that was previously ignored,
+// meaning a failed cudaMalloc or bad kernel launch would silently produce
+// wrong results or a null-pointer crash with no diagnosis.  CUDA_CHECK wraps
+// each call and aborts immediately with a clear message on any failure.
+//
+// cudaGetLastError() is called after each kernel launch because launch
+// configuration errors (wrong block size, insufficient shared memory) are
+// reported asynchronously — they won't appear until the next synchronisation
+// unless explicitly checked.
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call) do {                                                  \
+    cudaError_t _e = (call);                                                   \
+    if (_e != cudaSuccess) {                                                   \
+        fprintf(stderr, "\nCUDA error at %s:%d — %s\n",                       \
+                __FILE__, __LINE__, cudaGetErrorString(_e));                   \
+        exit(1);                                                               \
+    }                                                                          \
+} while(0)
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 #define BATCH_SIZE     (1 << 20)   // 1M passwords per GPU launch
 #define PW_STRIDE      128         // fixed bytes per password slot
+
+// Compile-time invariant: PW_STRIDE must be a power of two so that
+// gid * PW_STRIDE never produces misaligned accesses on the GPU.
+// This replaces the (pointer, size) anti-pattern that the C++ Core
+// Guidelines flag: the size is baked into the type rather than passed
+// alongside the pointer and trusted to match at runtime.
+static_assert((PW_STRIDE & (PW_STRIDE - 1)) == 0,
+              "PW_STRIDE must be a power of two");
 #define MAX_LINES      16
 #define MAX_TOKENS     11200
 #define MAX_TOKEN_LEN  32
@@ -327,10 +358,12 @@ static void build_and_upload_tables() {
         td2[x]=(td1[x]>>8)|(td1[x]<<24);
         td3[x]=(td2[x]>>8)|(td2[x]<<24);
     }
-    cudaMemcpyToSymbol(c_TD0,td0,1024); cudaMemcpyToSymbol(c_TD1,td1,1024);
-    cudaMemcpyToSymbol(c_TD2,td2,1024); cudaMemcpyToSymbol(c_TD3,td3,1024);
-    cudaMemcpyToSymbol(c_SBOX,h_SBOX,1024);
-    cudaMemcpyToSymbol(c_SBOX_INV,h_SBOX_INV,256);
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD0,     td0,       1024));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD1,     td1,       1024));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD2,     td2,       1024));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD3,     td3,       1024));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_SBOX,    h_SBOX,    1024));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_SBOX_INV,h_SBOX_INV,256));
 }
 
 // ---------------------------------------------------------------------------
@@ -589,10 +622,10 @@ struct ProducerState {
     uint64_t total_combos;
 
     std::mutex              mtx;
-    std::condition_variable cv_ready;   // signals main thread: batch is ready
-    std::condition_variable cv_consumed;// signals producer: batch was consumed
-    Batch* ready_batch;
-    bool   done;
+    std::condition_variable cv_ready;    // signals main thread: batch is ready
+    std::condition_variable cv_consumed; // signals producer: batch was consumed
+    std::unique_ptr<Batch>  ready_batch; // owned; transferred via std::move
+    bool                    done;
 
     ProducerState() : ready_batch(nullptr), done(false) {}
 };
@@ -613,7 +646,8 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         for (int i=0;i<n_lines;i++) { combo[i]=(int)(idx%line_sizes[i]); idx/=line_sizes[i]; }
     }
 
-    Batch* cur = new Batch();
+    // unique_ptr ensures Batch is freed even on early exit (exception or done signal).
+    auto cur = std::make_unique<Batch>();
     cur->passwords_total = pw_count_base;
     uint64_t combo_idx = state->start_combo;
 
@@ -622,10 +656,11 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         std::unique_lock<std::mutex> lk(state->mtx);
         state->cv_consumed.wait(lk,[&]{ return state->ready_batch==nullptr||state->done; });
         if (state->done) return;
-        state->ready_batch = cur;
+        uint64_t next_base = cur->passwords_total + cur->count;
+        state->ready_batch = std::move(cur);   // transfer ownership to main thread
         state->cv_ready.notify_one();
-        cur = new Batch();
-        cur->passwords_total = state->ready_batch->passwords_total + state->ready_batch->count;
+        cur = std::make_unique<Batch>();
+        cur->passwords_total = next_base;
     };
 
     // Stack-allocated hot-path buffers — reused across all combos and permutations.
@@ -708,8 +743,9 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         state->done = true;
         state->cv_ready.notify_all();
     }
-    delete cur;
+    // cur is a unique_ptr — freed automatically here
 }
+
 
 // ---------------------------------------------------------------------------
 // Save / restore
@@ -770,24 +806,28 @@ struct GPUEngine {
     int       h_found;
 
     GPUEngine() {
-        cudaMalloc(&d_pw,   (size_t)BATCH_SIZE * PW_STRIDE);
-        cudaMalloc(&d_lens, (size_t)BATCH_SIZE * 4);
-        cudaMalloc(&d_found, 4);
+        CUDA_CHECK(cudaMalloc(&d_pw,    (size_t)BATCH_SIZE * PW_STRIDE));
+        CUDA_CHECK(cudaMalloc(&d_lens,  (size_t)BATCH_SIZE * 4));
+        CUDA_CHECK(cudaMalloc(&d_found, 4));
         h_found = -1;
     }
     ~GPUEngine() { cudaFree(d_pw); cudaFree(d_lens); cudaFree(d_found); }
 
-    // Returns found password index (into the batch) or -1
+    // Returns found password index (into the batch) or -1.
+    // cudaGetLastError() is called after the kernel launch to catch
+    // configuration errors (bad block size, insufficient resources) that
+    // are reported asynchronously and would otherwise go undetected.
     int check(const Batch& b) {
         h_found = -1;
-        cudaMemcpy(d_pw,    b.pw_data.data(), (size_t)b.count * PW_STRIDE, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_lens,  b.pw_lens.data(), (size_t)b.count * 4,          cudaMemcpyHostToDevice);
-        cudaMemcpy(d_found, &h_found, 4, cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_pw,    b.pw_data.data(), (size_t)b.count * PW_STRIDE, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_lens,  b.pw_lens.data(), (size_t)b.count * 4,          cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_found, &h_found, 4, cudaMemcpyHostToDevice));
         int threads = 256;
         int blocks  = (b.count + threads - 1) / threads;
         check_kernel<<<blocks, threads>>>(d_pw, d_lens, b.count, PW_STRIDE, d_found);
-        cudaMemcpy(&h_found, d_found, 4, cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());        // catch async launch errors
+        CUDA_CHECK(cudaDeviceSynchronize());   // wait and catch execution errors
+        CUDA_CHECK(cudaMemcpy(&h_found, d_found, 4, cudaMemcpyDeviceToHost));
         return h_found;
     }
 };
@@ -830,8 +870,8 @@ int main(int argc, char** argv) {
     uint8_t h_enc[32], h_salt[8];
     load_wallet(wallet_path, h_enc, h_salt);
     build_and_upload_tables();
-    cudaMemcpyToSymbol(c_enc,  h_enc,  32);
-    cudaMemcpyToSymbol(c_salt, h_salt, 8);
+    CUDA_CHECK(cudaMemcpyToSymbol(c_enc,  h_enc,  32));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_salt, h_salt, 8));
 
     auto lines = parse_tokenlist(tokenlist_path);
     printf("Token list: %s (%d lines)\n", tokenlist_path, (int)lines.size());
@@ -869,16 +909,15 @@ int main(int argc, char** argv) {
            (unsigned long long)state.combo_idx, BATCH_SIZE);
 
     while (true) {
-        Batch* batch = nullptr;
+        std::unique_ptr<Batch> batch;
         {
             std::unique_lock<std::mutex> lk(ps.mtx);
             ps.cv_ready.wait(lk, [&]{ return ps.ready_batch != nullptr || ps.done; });
             if (ps.ready_batch) {
-                batch = ps.ready_batch;
-                ps.ready_batch = nullptr;
+                batch = std::move(ps.ready_batch);  // take ownership; no delete needed
                 ps.cv_consumed.notify_one();
             } else {
-                break; // done and no batch
+                break; // done and no pending batch
             }
         }
 
@@ -886,7 +925,9 @@ int main(int argc, char** argv) {
         pw_checked = batch->passwords_total + batch->count;
 
         if (found >= 0) {
-            // Reconstruct the found password from the batch buffer
+            // Password found: read directly from the batch buffer.
+            // The buffer contains the exact bytes the producer assembled,
+            // so no index-to-string reconstruction is needed.
             const uint8_t* pw = batch->pw_data.data() + found * PW_STRIDE;
             int len = batch->pw_lens[found];
             printf("\n*** PASSWORD FOUND: '");
@@ -899,13 +940,12 @@ int main(int argc, char** argv) {
             }
             ps.done = true;
             ps.cv_consumed.notify_all();
-            delete batch;
-            break;
+            break;  // batch freed automatically by unique_ptr destructor
         }
 
         state.combo_idx         = batch->combo_idx + 1;
         state.passwords_checked = pw_checked;
-        delete batch;
+        // batch freed automatically here by unique_ptr destructor
 
         // Progress: rate and ETA based on THIS SESSION only so a restored
         // run shows true current throughput, not inflated by historical totals.
