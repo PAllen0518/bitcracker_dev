@@ -103,4 +103,4 @@ KNOWN LIMITATIONS
 - No typos support (--typos-* flags)
 - Middle anchors (^N,M^) not implemented
 - Digit wildcard only (%0,4d); other wildcard types ignored
-- Found password index is reported but string reconstruction is TODO
+- Found password is printed directly from the batch buffer (correct and working)

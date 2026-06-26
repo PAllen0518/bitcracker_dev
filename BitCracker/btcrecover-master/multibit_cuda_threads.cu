@@ -728,6 +728,31 @@ static bool load_progress(const char* path, SaveState& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Progress display helpers
+// ---------------------------------------------------------------------------
+
+// Format a raw count with adaptive units so the display is readable at any scale.
+// 0.000T is useless for a 76M-password search; this shows "76.00M" instead.
+static const char* fmt_count(double n, char* buf) {
+    if      (n >= 1e12) sprintf(buf, "%.2fT", n/1e12);
+    else if (n >= 1e9)  sprintf(buf, "%.2fB", n/1e9);
+    else if (n >= 1e6)  sprintf(buf, "%.2fM", n/1e6);
+    else if (n >= 1e3)  sprintf(buf, "%.2fK", n/1e3);
+    else                sprintf(buf, "%.0f",  n);
+    return buf;
+}
+
+// Format seconds as a human-readable duration (5s / 3.2m / 1.4h / 23.1d).
+static const char* fmt_eta(double secs, char* buf) {
+    if (secs <= 0)           strcpy(buf, "---");
+    else if (secs < 60)      sprintf(buf, "%.0fs",  secs);
+    else if (secs < 3600)    sprintf(buf, "%.1fm",  secs/60);
+    else if (secs < 86400)   sprintf(buf, "%.1fh",  secs/3600);
+    else                     sprintf(buf, "%.1fd",  secs/86400);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
 // GPU engine (GPU buffers + kernel launch)
 // ---------------------------------------------------------------------------
 
@@ -873,14 +898,18 @@ int main(int argc, char** argv) {
         state.passwords_checked = pw_checked;
         delete batch;
 
-        // Progress
+        // Progress with adaptive units and ETA
         time_t now = time(nullptr);
-        double elapsed = difftime(now, start_time);
-        double rate = elapsed > 0 ? pw_checked / elapsed : 0;
-        printf("\r%16.3fT passwords  %10.0f/s  combo %llu/%llu",
-               pw_checked / 1e12, rate,
-               (unsigned long long)state.combo_idx,
-               (unsigned long long)total_combos);
+        double elapsed  = difftime(now, start_time);
+        double rate     = elapsed > 0 ? pw_checked / elapsed : 0;
+        double frac     = total_combos > 0 ? (double)state.combo_idx / total_combos : 0;
+        double eta_secs = (frac > 0.0001 && elapsed > 0) ? elapsed * (1.0 - frac) / frac : 0;
+        char pw_buf[32], rate_buf[32], eta_buf[32];
+        printf("\r%12s passwords  %9s/s  %.1f%%  ETA %s",
+               fmt_count((double)pw_checked, pw_buf),
+               fmt_count(rate, rate_buf),
+               frac * 100.0,
+               fmt_eta(eta_secs, eta_buf));
         fflush(stdout);
 
         if (autosave_path && difftime(now, last_save) >= 30.0) {
@@ -894,8 +923,11 @@ int main(int argc, char** argv) {
     if (state.combo_idx >= total_combos) {
         time_t now = time(nullptr);
         double elapsed = difftime(now, start_time);
-        printf("\nSearch complete. %.3fT passwords in %.0fs (%.0f/s). Not found.\n",
-               pw_checked / 1e12, elapsed, pw_checked / elapsed);
+        char pw_buf[32], rate_buf[32];
+        printf("\nSearch complete. %s passwords in %.0fs (%s/s). Not found.\n",
+               fmt_count((double)pw_checked, pw_buf),
+               elapsed,
+               fmt_count(elapsed > 0 ? pw_checked / elapsed : 0, rate_buf));
     }
     return 0;
 }
