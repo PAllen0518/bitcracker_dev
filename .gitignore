@@ -8,6 +8,7 @@ settings.json
 *.pyc
 *.pyo
 /addresses.db
+claude.md
 
 # Sensitive - wallet key files
 *.key
