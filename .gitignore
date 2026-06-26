@@ -2,6 +2,7 @@
 .clangd
 *_properties.json
 settings.json
+.zip
 
 # CLAUDE
 .claude
