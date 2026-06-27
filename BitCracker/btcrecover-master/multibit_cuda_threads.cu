@@ -777,10 +777,10 @@ static bool load_progress(const char* path, SaveState& s) {
 // Format a raw count with adaptive units so the display is readable at any scale.
 // 0.000T is useless for a 76M-password search; this shows "76.00M" instead.
 static const char* fmt_count(double n, char* buf) {
-    if      (n >= 1e12) sprintf(buf, "%.2fT", n/1e12);
-    else if (n >= 1e9)  sprintf(buf, "%.2fB", n/1e9);
+    if      (n >= 1e12) sprintf(buf, "%.6fT", n/1e12);  // 6 dp = 1M resolution at T scale
+    else if (n >= 1e9)  sprintf(buf, "%.3fB", n/1e9);   // 3 dp = 1M resolution at B scale
     else if (n >= 1e6)  sprintf(buf, "%.2fM", n/1e6);
-    else if (n >= 1e3)  sprintf(buf, "%.2fK", n/1e3);
+    else if (n >= 1e3)  sprintf(buf, "%.1fK", n/1e3);
     else                sprintf(buf, "%.0f",  n);
     return buf;
 }
@@ -960,7 +960,7 @@ int main(int argc, char** argv) {
         double frac           = total_combos > 0
                                     ? (double)state.combo_idx / total_combos : 0.0;
         char pw_buf[32], rate_buf[32], eta_buf[32];
-        printf("\r%12s passwords  %9s/s  %.1f%%  ETA %s",
+        printf("\r%16s passwords  %9s/s  %.1f%%  ETA %s",
                fmt_count((double)pw_checked, pw_buf),
                fmt_count(rate, rate_buf),
                frac * 100.0,
