@@ -19,8 +19,8 @@ search*.txt
 token*.txt
 Testsearch.txt
 
-# Sensitive - search notes containing candidate passwords
-Allan Search Notes*.txt
+# Sensitive - search notes containing candidate passwords (any naming variant)
+*[Ss]earch*[Nn]otes*.txt
 
 # Autosave/restore files from btcrecover and GPU recovery runs
 savefile*
