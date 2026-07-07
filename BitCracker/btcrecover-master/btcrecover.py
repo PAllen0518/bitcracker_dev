@@ -28,7 +28,22 @@
 from __future__ import print_function
 
 from btcrecover import btcrpass
-import sys, multiprocessing
+import sys, os, multiprocessing
+
+
+def write_found_password(password):
+    """Write the recovered password to a file instead of the terminal, so it
+    doesn't persist in scrollback, tmux/screen logs, or redirected output.
+    The file is created owner-read/write only where the OS supports it."""
+    path = "RECOVERED_PASSWORD.txt"
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    f = os.fdopen(fd, "wb")
+    try:
+        f.write(password.encode("utf-8", "replace") if isinstance(password, unicode) else password)
+    finally:
+        f.close()
+    print("Password found - written to " + path)
+
 
 if __name__ == "__main__":
 
@@ -38,9 +53,7 @@ if __name__ == "__main__":
     (password_found, not_found_msg) = btcrpass.main()
 
     if isinstance(password_found, basestring):
-        btcrpass.safe_print("Password found: '" + password_found + "'")
-        if any(ord(c) < 32 or ord(c) > 126 for c in password_found):
-            print("HTML encoded:   '" + password_found.encode("ascii", "xmlcharrefreplace") + "'")
+        write_found_password(password_found)
         retval = 0
 
     elif not_found_msg:

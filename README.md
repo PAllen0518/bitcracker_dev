@@ -64,12 +64,15 @@ See `BitCracker/btcrecover-master/multibit_cuda_requirements.txt` for full detai
 
 ### Python GPU tool (`multibit_gpu.py`)
 ```
-pip install pyopencl numpy pycryptodome
+pip install -r BitCracker/btcrecover-master/requirements-py3.txt
 ```
 
 ### CPU tool (`btcrecover.py`)
 - Python 2.7
-- PyCrypto (recommended for speed)
+- PyCrypto (recommended for speed):
+  ```
+  C:\python27\python -m pip install -r BitCracker/btcrecover-master/requirements-py2.txt
+  ```
 
 ---
 

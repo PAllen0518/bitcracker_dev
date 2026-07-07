@@ -28,6 +28,22 @@
 #include <cuda_runtime.h>
 
 // ---------------------------------------------------------------------------
+// CUDA error checking (see multibit_cuda_threads.cu for the same pattern).
+// Every CUDA API call returns an error code; left unchecked, a failed
+// cudaMalloc or bad kernel launch silently produces wrong results or a
+// null-pointer crash with no diagnosis. CUDA_CHECK wraps each call and
+// aborts immediately with a clear message on any failure.
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call) do {                                                  \
+    cudaError_t _e = (call);                                                   \
+    if (_e != cudaSuccess) {                                                   \
+        fprintf(stderr, "\nCUDA error at %s:%d — %s\n",                       \
+                __FILE__, __LINE__, cudaGetErrorString(_e));                   \
+        exit(1);                                                               \
+    }                                                                          \
+} while(0)
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -474,12 +490,12 @@ static void build_td_tables(uint32_t* td0, uint32_t* td1,
 static void upload_tables() {
     uint32_t td0[256], td1[256], td2[256], td3[256];
     build_td_tables(td0, td1, td2, td3);
-    cudaMemcpyToSymbol(c_TD0, td0, 256*sizeof(uint32_t));
-    cudaMemcpyToSymbol(c_TD1, td1, 256*sizeof(uint32_t));
-    cudaMemcpyToSymbol(c_TD2, td2, 256*sizeof(uint32_t));
-    cudaMemcpyToSymbol(c_TD3, td3, 256*sizeof(uint32_t));
-    cudaMemcpyToSymbol(c_SBOX,    h_SBOX,    256*sizeof(uint32_t));
-    cudaMemcpyToSymbol(c_SBOX_INV,h_SBOX_INV,256*sizeof(uint8_t));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD0, td0, 256*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD1, td1, 256*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD2, td2, 256*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_TD3, td3, 256*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_SBOX,    h_SBOX,    256*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_SBOX_INV,h_SBOX_INV,256*sizeof(uint8_t)));
 }
 
 // ---------------------------------------------------------------------------
@@ -810,8 +826,8 @@ int main(int argc, char** argv) {
 
     // Upload tables and wallet data
     upload_tables();
-    cudaMemcpyToSymbol(c_enc,  h_enc,  32);
-    cudaMemcpyToSymbol(c_salt, h_salt, 8);
+    CUDA_CHECK(cudaMemcpyToSymbol(c_enc,  h_enc,  32));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_salt, h_salt, 8));
 
     // Parse token list
     TokenListLine lines[MAX_LINES];
@@ -833,12 +849,12 @@ int main(int argc, char** argv) {
 
     // Allocate GPU combo task buffer
     ComboTask* d_tasks = NULL;
-    cudaMalloc(&d_tasks, COMBO_BATCH_SIZE * sizeof(ComboTask));
+    CUDA_CHECK(cudaMalloc(&d_tasks, COMBO_BATCH_SIZE * sizeof(ComboTask)));
 
     int* d_found_combo = NULL;
     int* d_found_perm  = NULL;
-    cudaMalloc(&d_found_combo, sizeof(int));
-    cudaMalloc(&d_found_perm,  sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_found_combo, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_found_perm,  sizeof(int)));
 
     ComboTask* h_tasks = (ComboTask*)malloc(COMBO_BATCH_SIZE * sizeof(ComboTask));
     if (!h_tasks) { fprintf(stderr, "OOM\n"); return 1; }
@@ -872,19 +888,20 @@ int main(int argc, char** argv) {
         if (valid_tasks == 0) { state.combo_idx = batch_end; continue; }
 
         // Upload tasks and reset found flags
-        cudaMemcpy(d_tasks, h_tasks, valid_tasks * sizeof(ComboTask), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_tasks, h_tasks, valid_tasks * sizeof(ComboTask), cudaMemcpyHostToDevice));
         h_found_combo = -1; h_found_perm = -1;
-        cudaMemcpy(d_found_combo, &h_found_combo, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_found_perm,  &h_found_perm,  sizeof(int), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_found_combo, &h_found_combo, sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_found_perm,  &h_found_perm,  sizeof(int), cudaMemcpyHostToDevice));
 
         // Launch: one block per combo, THREADS_PER_BLOCK threads per block
         multibit_check_kernel<<<valid_tasks, THREADS_PER_BLOCK>>>(
             d_tasks, valid_tasks, d_found_combo, d_found_perm);
-        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());        // catch async launch errors
+        CUDA_CHECK(cudaDeviceSynchronize());   // wait and catch execution errors
 
         // Check result
-        cudaMemcpy(&h_found_combo, d_found_combo, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&h_found_perm,  d_found_perm,  sizeof(int), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&h_found_combo, d_found_combo, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&h_found_perm,  d_found_perm,  sizeof(int), cudaMemcpyDeviceToHost));
 
         if (h_found_combo >= 0) {
             printf("\n*** PASSWORD FOUND in combo %d, perm %d ***\n",
@@ -917,6 +934,8 @@ int main(int argc, char** argv) {
 
     printf("\nSearch complete. Password not found.\n");
     free(h_tasks);
-    cudaFree(d_tasks); cudaFree(d_found_combo); cudaFree(d_found_perm);
+    CUDA_CHECK(cudaFree(d_tasks));
+    CUDA_CHECK(cudaFree(d_found_combo));
+    CUDA_CHECK(cudaFree(d_found_perm));
     return 0;
 }

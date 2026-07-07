@@ -21,6 +21,7 @@ Usage:
 """
 
 import sys
+import os
 import argparse
 import hashlib
 import base64
@@ -34,6 +35,17 @@ import queue as _queue
 from math import factorial
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+
+
+def write_found_password(password):
+    """Write the recovered password to a file instead of the terminal, so it
+    doesn't persist in scrollback, tmux/screen logs, or redirected output.
+    The file is created owner-read/write only where the OS supports it."""
+    path = "RECOVERED_PASSWORD.txt"
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(password)
+    print(f"\n*** PASSWORD FOUND - written to {path} ***")
 
 try:
     import pyopencl as cl
@@ -1181,7 +1193,7 @@ def _run_search(engine, args, token_lists, wallet_path, tokenlist_path,
         total += len(batch)
 
         if result:
-            print(f"\n*** PASSWORD FOUND: '{result}' ***")
+            write_found_password(result)
             if args.autosave:
                 save_state(args.autosave, total, last_combo_idx, last_perm_idx, tokenlist_path, wallet_path)
             return

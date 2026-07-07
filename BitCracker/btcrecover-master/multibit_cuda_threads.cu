@@ -35,6 +35,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <cuda_runtime.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <string>
 #include <vector>
@@ -770,6 +773,25 @@ static bool load_progress(const char* path, SaveState& s) {
     fclose(f); return ok;
 }
 
+// Write the recovered password to a file instead of the terminal, so it
+// doesn't persist in scrollback, tmux/screen logs, or redirected output.
+// The file is created owner-read/write only (_S_IREAD|_S_IWRITE).
+static void write_found_password(const uint8_t* pw, int len) {
+    const char* path = "RECOVERED_PASSWORD.txt";
+    int fd = _open(path, _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY,
+                    _S_IREAD | _S_IWRITE);
+    if (fd < 0) {
+        fprintf(stderr, "\nWARNING: could not create %s; printing password below instead.\n", path);
+        printf("\n*** PASSWORD FOUND: '");
+        fwrite(pw, 1, len, stdout);
+        printf("' ***\n");
+        return;
+    }
+    _write(fd, pw, len);
+    _close(fd);
+    printf("\n*** PASSWORD FOUND - written to %s ***\n", path);
+}
+
 // ---------------------------------------------------------------------------
 // Progress display helpers
 // ---------------------------------------------------------------------------
@@ -930,9 +952,7 @@ int main(int argc, char** argv) {
             // so no index-to-string reconstruction is needed.
             const uint8_t* pw = batch->pw_data.data() + found * PW_STRIDE;
             int len = batch->pw_lens[found];
-            printf("\n*** PASSWORD FOUND: '");
-            fwrite(pw, 1, len, stdout);
-            printf("' ***\n");
+            write_found_password(pw, len);
             if (autosave_path) {
                 state.combo_idx = batch->combo_idx;
                 state.passwords_checked = pw_checked;

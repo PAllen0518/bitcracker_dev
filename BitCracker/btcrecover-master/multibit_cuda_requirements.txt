@@ -25,7 +25,13 @@ Windows SDK
 Known Build Issues
   1. Username with spaces (e.g. "Paul Allen") causes nvcc to generate temp file
      paths without quotes, which breaks cl.exe.
-     Fix: set TEMP=C:\Temp and TMP=C:\Temp before compiling (done in build_cuda.bat).
+     Fix: set TEMP=C:\Temp and TMP=C:\Temp before compiling (done in build_cuda.bat,
+     override with the BUILD_TEMP_DIR env var if C:\Temp isn't suitable).
+
+  1a. build_cuda.bat's toolchain paths are overridable via environment
+      variables if your CUDA/VS install locations differ from the defaults
+      below: CUDA_TOOLKIT_DIR (CUDA Toolkit root), VS_TOOLS_BINDIR (MSVC
+      host-compiler bin dir), BUILD_TEMP_DIR (nvcc temp dir).
 
   2. CUDA 13.0 does not support VS 2026 (MSVC 19.51). Must use VS 2022.
 

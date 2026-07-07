@@ -25,6 +25,9 @@ Testsearch.txt
 # Autosave/restore files from btcrecover and GPU recovery runs
 savefile*
 *.pkl
+
+# Recovered passwords, written to a file instead of stdout (never commit these)
+RECOVERED_PASSWORD.txt
 # CUDA Build Artifacts
 *.exe
 *.bin
