@@ -5,15 +5,6 @@ multibit_gpu.py - GPU-accelerated MultiBit Classic wallet password recovery.
 Reads btcrecover-compatible token list files, generates passwords on CPU,
 and checks them against a MultiBit .key file using an OpenCL kernel on the GPU.
 
-Architecture overview:
-  - Passwords are generated on the CPU (Python/itertools) in a background thread.
-  - Each batch of ~1M passwords is transferred to the RTX 2060 via OpenCL.
-  - The GPU kernel runs 3x MD5 + AES-256-CBC + base58 validation for every
-    password in parallel, one password per work item.
-  - The CPU and GPU overlap: while the GPU checks batch N, the CPU generates batch N+1.
-  - OpenCL was chosen over CUDA for portability, and because PyOpenCL is available
-    for Python 3.10 on Windows without a full CUDA toolkit install.
-
 Usage:
     python multibit_gpu.py --wallet multi.key --tokenlist search45.txt
     python multibit_gpu.py --wallet multi.key --tokenlist search45.txt --autosave save.pkl
@@ -33,8 +24,6 @@ import re
 import threading
 import queue as _queue
 from math import factorial
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
 
 
 def write_found_password(password):
@@ -61,18 +50,7 @@ except ImportError:
     sys.exit("Required: pip install pycryptodome")
 
 # ---------------------------------------------------------------------------
-# AES TD table precomputation
-#
-# AES decryption using the "equivalent inverse cipher" (FIPS 197 §5.3.5) relies
-# on four 256-entry lookup tables (TD0-TD3) that fuse InvSubBytes, InvShiftRows,
-# and InvMixColumns into a single XOR operation per round.  This gives 4 lookups
-# per column per round instead of ~12 separate operations.
-#
-# We compute the tables in Python at import time and inject them into the OpenCL
-# kernel source as literal uint arrays. Computing them inside the kernel instead
-# would burn GPU cycles on every work item, every run.
-# Embedding them as __constant arrays lets the GPU cache them in L2 (3 MB on the
-# RTX 2060), which comfortably holds our 16 KB of table data.
+# Precompute AES Td0 table (used in kernel for InvMixColumns)
 # ---------------------------------------------------------------------------
 
 def _build_td_tables():
@@ -118,9 +96,6 @@ def _build_td_tables():
 
 _TD0, _TD1, _TD2, _TD3 = _build_td_tables()
 
-# Format tables as C initialiser lists for string-injection into the kernel source.
-# String injection is used because OpenCL has no preprocessor mechanism to embed
-# large constant arrays from the host at compile time.
 def _arr_src(t): return "{ " + ", ".join("0x{:08x}u".format(v) for v in t) + " }"
 _TD0_SRC = _arr_src(_TD0)
 _TD1_SRC = _arr_src(_TD1)
@@ -132,35 +107,9 @@ _TD3_SRC = _arr_src(_TD3)
 # ---------------------------------------------------------------------------
 
 KERNEL_SOURCE = r"""
-/*
- * MultiBit Classic GPU checker: 3x MD5 + AES-256-CBC + base58 validation
- *
- * MultiBit Classic key derivation (OpenSSL EVP_BytesToKey with MD5):
- *   salted    = password_bytes + salt          (8-byte random salt from wallet file)
- *   key1      = MD5(salted)                    (first 16 bytes of AES key)
- *   key2      = MD5(key1 + salted)             (second 16 bytes of AES key)
- *   iv        = MD5(key2 + salted)             (AES IV)
- *   aes_key   = key1 + key2                    (32 bytes → AES-256)
- *
- * Password bytes: MultiBit uses UTF-16-LE then takes every other byte, which
- * for pure ASCII passwords is the same as plain ASCII, so we pass ASCII bytes
- * directly and get the same result.
- *
- * Validation: decrypt the first 32 bytes of the wallet's encrypted section.
- * A valid password produces Bitcoin private key bytes, which are base58-encoded.
- * The first byte is always L, K, 5, or Q (WIF format prefix) and all 32 bytes
- * must be valid base58 characters.  This lets us reject wrong passwords after
- * decrypting just the first AES block (16 bytes) in the common case.
- */
+/* MultiBit Classic GPU checker: 3x MD5 + AES-256-CBC + base58 validation */
 
 /* ---- MD5 ---- */
-/*
- * MD5 is hand-rolled in OpenCL C because there is no standard crypto library
- * available in OpenCL kernels.  The macro-based approach expands all 64 rounds
- * inline, which lets the compiler schedule instructions freely across rounds
- * without call overhead.  Using the OpenCL built-in rotate() for ROTL ensures
- * the compiler emits a single rotate instruction rather than two shifts + OR.
- */
 #define F(x,y,z) (((x)&(y))|(~(x)&(z)))
 #define G(x,y,z) (((x)&(z))|((y)&~(z)))
 #define H(x,y,z) ((x)^(y)^(z))
@@ -253,15 +202,7 @@ void md5(const uchar *data, uint len, uchar *digest) {
 }
 
 /* ---- AES-256 ---- */
-/*
- * SBOX and SBOX_INV are stored in __constant memory (NVIDIA maps this to a
- * dedicated 64 KB constant cache).  TD0-TD3 are also __constant; they total
- * ~16 KB which fits comfortably in the RTX 2060's 3 MB L2 cache.
- *
- * We tried moving these to __local (shared) memory to avoid non-broadcast
- * constant-cache accesses, but measured a slowdown: the cooperative fill + barrier
- * overhead exceeded the benefit, because the L2 already held the tables hot.
- */
+
 __constant uint SBOX[256] = {
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -287,20 +228,11 @@ __constant uint TD1[256] = """ + _TD1_SRC + r""";
 __constant uint TD2[256] = """ + _TD2_SRC + r""";
 __constant uint TD3[256] = """ + _TD3_SRC + r""";
 
-/*
- * AES-256 key schedule, equivalent inverse cipher (FIPS 197 5.3.5).
- *
- * The TD-table decryption loop computes InvMixColumns implicitly via table
- * lookups. For that to work, the round keys for rounds 1-13 (words 4-55) need
- * InvMixColumns applied ahead of time. The first and last round keys (words
- * 0-3 and 56-59) go through AddRoundKey steps that skip the TD tables, so they
- * stay as-is.
- *
- * The "direct inverse cipher" would need separate InvSubBytes and InvMixColumns
- * tables and is slower per round.
- */
-void aes256_key_expand(const uchar *key, __private uint *rk) {
-    /* Step 1: standard AES-256 key expansion */
+/* AES-256 key schedule using local-memory copies of SBOX and TD tables. */
+void aes256_key_expand(const uchar *key, __private uint *rk,
+                       __local const uchar *l_SBOX,
+                       __local const uint  *l_TD0, __local const uint *l_TD1,
+                       __local const uint  *l_TD2, __local const uint *l_TD3) {
     const uint RCON[7] = {0x01000000u,0x02000000u,0x04000000u,0x08000000u,
                           0x10000000u,0x20000000u,0x40000000u};
     for (int i = 0; i < 8; i++)
@@ -308,20 +240,19 @@ void aes256_key_expand(const uchar *key, __private uint *rk) {
     for (int i = 8; i < 60; i++) {
         uint t = rk[i-1];
         if (i % 8 == 0) {
-            t = (SBOX[(t>>16)&0xff]<<24)|(SBOX[(t>>8)&0xff]<<16)|(SBOX[t&0xff]<<8)|SBOX[(t>>24)&0xff];
+            t = ((uint)l_SBOX[(t>>16)&0xff]<<24)|((uint)l_SBOX[(t>>8)&0xff]<<16)
+               |((uint)l_SBOX[t&0xff]<<8)|(uint)l_SBOX[(t>>24)&0xff];
             t ^= RCON[i/8 - 1];
         } else if (i % 8 == 4) {
-            t = (SBOX[(t>>24)&0xff]<<24)|(SBOX[(t>>16)&0xff]<<16)|(SBOX[(t>>8)&0xff]<<8)|SBOX[t&0xff];
+            t = ((uint)l_SBOX[(t>>24)&0xff]<<24)|((uint)l_SBOX[(t>>16)&0xff]<<16)
+               |((uint)l_SBOX[(t>>8)&0xff]<<8)|(uint)l_SBOX[t&0xff];
         }
         rk[i] = rk[i-8] ^ t;
     }
-    /* Step 2: apply InvMixColumns to round key words 4..55 so that the
-       TD-table XOR in each middle round produces the correct result.
-       InvMixColumns(w) = TD0[SBOX[b0]] ^ TD1[SBOX[b1]] ^ TD2[SBOX[b2]] ^ TD3[SBOX[b3]] */
     for (int i = 4; i < 56; i++) {
         uint w = rk[i];
-        rk[i] = TD0[SBOX[(w>>24)&0xff]] ^ TD1[SBOX[(w>>16)&0xff]]
-               ^ TD2[SBOX[(w>>8)&0xff]]  ^ TD3[SBOX[w&0xff]];
+        rk[i] = l_TD0[l_SBOX[(w>>24)&0xff]] ^ l_TD1[l_SBOX[(w>>16)&0xff]]
+               ^ l_TD2[l_SBOX[(w>>8)&0xff]]  ^ l_TD3[l_SBOX[w&0xff]];
     }
 }
 
@@ -345,21 +276,12 @@ __constant uchar SBOX_INV[256] = {
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 };
 
-/*
- * AES-256 CBC decrypt one 16-byte block given a pre-expanded key schedule.
- *
- * Key expansion is separated from block decryption so we expand once and reuse
- * rk[] for both ciphertext blocks.  This saves ~60 operations per password.
- *
- * Each middle round does 4 TD-table lookups + XOR per column (4 columns = 16
- * lookups per round, 13 middle rounds = 208 lookups total per block).  The
- * final round uses SBOX_INV directly because InvMixColumns is not applied there.
- *
- * The InvShiftRows pattern shows up in the column index offsets: s0 uses row 0
- * of each column un-shifted, s1 uses row 3, s2 uses row 2, s3 uses row 1. That's
- * the inverse of AES's ShiftRows baked into the column selection.
- */
-void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const uchar *ct, uchar *pt) {
+/* AES-256 CBC decrypt a single 16-byte block given pre-expanded round keys.
+   Uses local-memory TD tables and SBOX_INV for faster non-broadcast lookups. */
+void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const uchar *ct, uchar *pt,
+                          __local const uint  *l_TD0, __local const uint  *l_TD1,
+                          __local const uint  *l_TD2, __local const uint  *l_TD3,
+                          __local const uchar *l_SBOX_INV) {
     uint s0 = ((uint)ct[ 0]<<24)|((uint)ct[ 1]<<16)|((uint)ct[ 2]<<8)|ct[ 3];
     uint s1 = ((uint)ct[ 4]<<24)|((uint)ct[ 5]<<16)|((uint)ct[ 6]<<8)|ct[ 7];
     uint s2 = ((uint)ct[ 8]<<24)|((uint)ct[ 9]<<16)|((uint)ct[10]<<8)|ct[11];
@@ -369,17 +291,17 @@ void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const ucha
 
     uint t0,t1,t2,t3;
     for (int r = 13; r >= 1; r--) {
-        t0 = TD0[(s0>>24)&0xff]^TD1[(s3>>16)&0xff]^TD2[(s2>>8)&0xff]^TD3[s1&0xff]^rk[r*4+0];
-        t1 = TD0[(s1>>24)&0xff]^TD1[(s0>>16)&0xff]^TD2[(s3>>8)&0xff]^TD3[s2&0xff]^rk[r*4+1];
-        t2 = TD0[(s2>>24)&0xff]^TD1[(s1>>16)&0xff]^TD2[(s0>>8)&0xff]^TD3[s3&0xff]^rk[r*4+2];
-        t3 = TD0[(s3>>24)&0xff]^TD1[(s2>>16)&0xff]^TD2[(s1>>8)&0xff]^TD3[s0&0xff]^rk[r*4+3];
+        t0 = l_TD0[(s0>>24)&0xff]^l_TD1[(s3>>16)&0xff]^l_TD2[(s2>>8)&0xff]^l_TD3[s1&0xff]^rk[r*4+0];
+        t1 = l_TD0[(s1>>24)&0xff]^l_TD1[(s0>>16)&0xff]^l_TD2[(s3>>8)&0xff]^l_TD3[s2&0xff]^rk[r*4+1];
+        t2 = l_TD0[(s2>>24)&0xff]^l_TD1[(s1>>16)&0xff]^l_TD2[(s0>>8)&0xff]^l_TD3[s3&0xff]^rk[r*4+2];
+        t3 = l_TD0[(s3>>24)&0xff]^l_TD1[(s2>>16)&0xff]^l_TD2[(s1>>8)&0xff]^l_TD3[s0&0xff]^rk[r*4+3];
         s0=t0; s1=t1; s2=t2; s3=t3;
     }
     /* Final round: InvShiftRows + InvSubBytes (no InvMixColumns) */
-    t0 = ((uint)SBOX_INV[(s0>>24)&0xff]<<24)|((uint)SBOX_INV[(s3>>16)&0xff]<<16)|((uint)SBOX_INV[(s2>>8)&0xff]<<8)|SBOX_INV[s1&0xff];
-    t1 = ((uint)SBOX_INV[(s1>>24)&0xff]<<24)|((uint)SBOX_INV[(s0>>16)&0xff]<<16)|((uint)SBOX_INV[(s3>>8)&0xff]<<8)|SBOX_INV[s2&0xff];
-    t2 = ((uint)SBOX_INV[(s2>>24)&0xff]<<24)|((uint)SBOX_INV[(s1>>16)&0xff]<<16)|((uint)SBOX_INV[(s0>>8)&0xff]<<8)|SBOX_INV[s3&0xff];
-    t3 = ((uint)SBOX_INV[(s3>>24)&0xff]<<24)|((uint)SBOX_INV[(s2>>16)&0xff]<<16)|((uint)SBOX_INV[(s1>>8)&0xff]<<8)|SBOX_INV[s0&0xff];
+    t0 = ((uint)l_SBOX_INV[(s0>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s3>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s2>>8)&0xff]<<8)|l_SBOX_INV[s1&0xff];
+    t1 = ((uint)l_SBOX_INV[(s1>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s0>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s3>>8)&0xff]<<8)|l_SBOX_INV[s2&0xff];
+    t2 = ((uint)l_SBOX_INV[(s2>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s1>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s0>>8)&0xff]<<8)|l_SBOX_INV[s3&0xff];
+    t3 = ((uint)l_SBOX_INV[(s3>>24)&0xff]<<24)|((uint)l_SBOX_INV[(s2>>16)&0xff]<<16)|((uint)l_SBOX_INV[(s1>>8)&0xff]<<8)|l_SBOX_INV[s0&0xff];
 
     /* AddRoundKey (round 0) */
     t0^=rk[0]; t1^=rk[1]; t2^=rk[2]; t3^=rk[3];
@@ -398,16 +320,6 @@ void aes256_block_decrypt(__private uint *rk, const uchar *xor_block, const ucha
 }
 
 /* ---- Base58 validation ---- */
-/*
- * Bitcoin private keys in WIF format are base58-encoded, using the alphabet
- * 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz (58 chars).
- * The omitted chars are 0 (zero), O, I, and l, which are easy to mix up.
- *
- * Checking base58 validity is much cheaper than a full Bitcoin key parse, so we
- * use it as the rejection filter. A wrong password decrypts to random bytes, and
- * the odds of all 32 of them landing on valid base58 chars by chance are about
- * (58/94)^32, or 1 in 10^8, so false positives are effectively nil.
- */
 /* Returns 1 if ALL bytes in buf[0..len-1] are valid base58 characters */
 int all_b58(const uchar *buf, uint len) {
     for (uint i = 0; i < len; i++) {
@@ -422,26 +334,12 @@ int all_b58(const uchar *buf, uint len) {
 
 /* ---- Main kernel ---- */
 /*
- * One work item = one password.  We chose this 1:1 mapping because:
- *   - Each password requires independent state (salted[], key1/key2/iv, rk[60]).
- *   - The RTX 2060 has 1920 CUDA cores; with batch sizes of 1M we launch far
- *     more work items than cores, so the GPU scheduler keeps all cores busy.
- *   - Mapping multiple passwords per work item would complicate register usage
- *     without improving occupancy (we're already thread-count limited, not
- *     memory-limited).
- *
- * Two-stage early rejection minimises wasted AES work:
- *   Stage 1: after decrypting block 1, check the first byte (must be L/K/5/Q).
- *            Only 4 of 256 values pass → 98.4% of wrong passwords exit here.
- *   Stage 2: check remaining 15 bytes of block 1 for base58 validity.
- *   Stage 3: decrypt block 2 and check all 16 bytes for base58 validity.
- *
- * Parameters:
- *   pw_data:   flat array of passwords, each padded to pw_stride bytes
- *   pw_lens:   byte length of each password (0 = padding slot, skip it)
- *   salt:      8-byte MultiBit salt (same for all passwords in a batch)
- *   enc:       32-byte ciphertext from the wallet file (same for all passwords)
- *   found_idx: output, set atomically to (gid+1) of the first matching password
+ * Each work item processes one password.
+ * pw_data:   packed passwords, each occupying pw_stride bytes (null-padded)
+ * pw_lens:   byte length of each password
+ * salt:      8-byte MultiBit salt (constant for all passwords)
+ * enc:       32-byte encrypted data (two 16-byte AES blocks) from the wallet
+ * found_idx: output - set to (global_id + 1) of the first found password, or 0
  */
 __kernel void multibit_check(
     __global const uchar *pw_data,
@@ -451,8 +349,27 @@ __kernel void multibit_check(
     __global       uint  *found_idx,
     const          uint   pw_stride
 ) {
-    uint gid = get_global_id(0);
+    /* Copy lookup tables from constant to local (shared) memory.
+       All threads in the work-group cooperate; local reads are broadcast-friendly
+       and subsequent per-thread accesses avoid constant cache thrashing. */
+    __local uint  l_TD0[256], l_TD1[256], l_TD2[256], l_TD3[256];
+    __local uchar l_SBOX[256], l_SBOX_INV[256];
+    int lid   = (int)get_local_id(0);
+    int lsize = (int)get_local_size(0);
+    for (int i = lid; i < 256; i += lsize) {
+        l_TD0[i]      = TD0[i];
+        l_TD1[i]      = TD1[i];
+        l_TD2[i]      = TD2[i];
+        l_TD3[i]      = TD3[i];
+        l_SBOX[i]     = (uchar)SBOX[i];
+        l_SBOX_INV[i] = SBOX_INV[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
+    /* Early exit: skip remaining work if another thread already found a match. */
+    if (found_idx[0]) return;
+
+    uint gid = get_global_id(0);
     uint pw_len = pw_lens[gid];
     if (pw_len == 0) return;
 
@@ -485,20 +402,17 @@ __kernel void multibit_check(
     for (uint i = 0; i < 16; i++) aes_key[i]    = key1[i];
     for (uint i = 0; i < 16; i++) aes_key[16+i] = key2[i];
 
-    /* Copy enc to private memory.
-     * NVIDIA's OpenCL compiler enforces strict address space rules: passing a
-     * __constant pointer where a generic pointer is expected is a compile error.
-     * Copying to a private array resolves this without any runtime cost. */
+    /* Copy enc to private memory (NVIDIA OpenCL requires matching address spaces) */
     uchar enc_local[32];
     for (uint i = 0; i < 32; i++) enc_local[i] = enc[i];
 
     /* Expand key once; reuse for both AES blocks */
     uint rk[60];
-    aes256_key_expand(aes_key, rk);
+    aes256_key_expand(aes_key, rk, l_SBOX, l_TD0, l_TD1, l_TD2, l_TD3);
 
     /* Decrypt first AES block (IV = iv, CT = enc_local[0..15]) */
     uchar pt1[16];
-    aes256_block_decrypt(rk, iv, enc_local, pt1);
+    aes256_block_decrypt(rk, iv, enc_local, pt1, l_TD0, l_TD1, l_TD2, l_TD3, l_SBOX_INV);
 
     /* Quick check: first byte must be L, K, 5, or Q */
     uchar b0 = pt1[0];
@@ -509,7 +423,7 @@ __kernel void multibit_check(
 
     /* Decrypt second AES block (IV = first ciphertext block = enc_local[0..15]) */
     uchar pt2[16];
-    aes256_block_decrypt(rk, enc_local, enc_local + 16, pt2);
+    aes256_block_decrypt(rk, enc_local, enc_local + 16, pt2, l_TD0, l_TD1, l_TD2, l_TD3, l_SBOX_INV);
     if (!all_b58(pt2, 16)) return;
 
     /* Found! Record this work item's index (1-based) */
@@ -519,14 +433,6 @@ __kernel void multibit_check(
 
 # ---------------------------------------------------------------------------
 # MultiBit wallet loader
-#
-# A MultiBit Classic .key file is a text file whose first 64 characters are
-# base64-encoded data in OpenSSL "Salted__" format:
-#   bytes  0- 7: magic "Salted__"
-#   bytes  8-15: 8-byte random salt
-#   bytes 16-47: 32 bytes of AES-256-CBC ciphertext (two 16-byte blocks)
-# We only need the salt and the first 32 ciphertext bytes; everything else
-# in the file can be ignored.
 # ---------------------------------------------------------------------------
 
 class WalletMultiBit:
@@ -535,25 +441,20 @@ class WalletMultiBit:
         self._salt  = salt             # 8 bytes
 
     @classmethod
-    def load(cls, filename: str) -> "WalletMultiBit":
+    def load(cls, filename):
         with open(filename, "r") as f:
             raw = f.read(70)
         data = b"".join(raw.encode("ascii").split())
         if len(data) < 64:
             raise ValueError("MultiBit key file too short")
         data = base64.b64decode(data[:64])
-        # assert replaced with explicit check: assert is silently disabled
-        # by the Python -O flag, making it unreliable as an error guard.
-        if data[:8] != b"Salted__":
-            raise ValueError("Not a MultiBit key file (missing 'Salted__' header)")
+        assert data[:8] == b"Salted__", "Not a MultiBit key file"
         if len(data) < 48:
             raise ValueError("MultiBit key file decodes to less than 48 bytes")
         return cls(encrypted_block=data[16:48], salt=data[8:16])
 
-    def verify_cpu(self, password: str) -> bool:
-        """CPU re-verification of a GPU hit before reporting it as found.
-        The GPU uses atomic_cmpxchg which can in theory store a false positive
-        (e.g. a base58 collision); this CPU check is the authoritative test."""
+    def verify_cpu(self, password):
+        """CPU verification for confirming a GPU hit."""
         pw_bytes = password.encode("utf-8")
         salted = pw_bytes + self._salt
         key1 = hashlib.md5(salted).digest()
@@ -571,19 +472,11 @@ class WalletMultiBit:
 
 # ---------------------------------------------------------------------------
 # OpenCL engine
-#
-# BATCH_SIZE: 1M passwords per kernel launch.  Larger batches amortise kernel
-# launch overhead and give the GPU more work to pipeline internally.  We chose
-# 1M after testing; at ~500k passwords/s generation rate one batch takes ~2 s,
-# which is long enough to keep the GPU fed between launches.
-#
-# PW_STRIDE: all passwords padded to 128 bytes so each work item can find its
-# password with a simple pointer offset (gid * stride).  Variable-length storage
-# would require a separate offset table and non-coalesced memory access.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE   = 1048576  # passwords per GPU kernel launch
-PW_STRIDE    = 128      # fixed stride per password (max supported length)
+BATCH_SIZE   = 1048576  # GPU processes faster than CPU generates
+PW_STRIDE    = 128      # max password length in bytes
+LOCAL_SIZE   = 128      # OpenCL work-group size tuned for RTX 2060 (warp=32, 30 SMs)
 
 class GPUEngine:
     def __init__(self, wallet, batch_size=BATCH_SIZE):
@@ -594,67 +487,44 @@ class GPUEngine:
         for p in platforms:
             gpu_devices += p.get_devices(cl.device_type.GPU)
         if not gpu_devices:
-            # Raise instead of sys.exit: constructors should not terminate
-            # the process; let the caller decide how to handle missing hardware.
-            raise RuntimeError("No OpenCL GPU devices found.")
+            sys.exit("No OpenCL GPU devices found.")
         self._device  = gpu_devices[0]
         print(f"Using GPU: {self._device.name.strip()}")
         self._ctx     = cl.Context([self._device])
         self._queue   = cl.CommandQueue(self._ctx)
-        # PyOpenCL caches compiled kernels on disk keyed by source hash, so
-        # subsequent runs skip recompilation (~5 s saved per run).
         self._program = cl.Program(self._ctx, KERNEL_SOURCE).build()
         self._kernel  = self._program.multibit_check
 
         mf = cl.mem_flags
-        enc_np   = np.frombuffer(wallet._enc,  dtype=np.uint8)
-        salt_np  = np.frombuffer(wallet._salt, dtype=np.uint8)
-        # Salt and ciphertext are the same for every password in every batch,
-        # so we upload them once at init and keep them in GPU memory permanently.
+        enc_np  = np.frombuffer(wallet._enc,  dtype=np.uint8)
+        salt_np = np.frombuffer(wallet._salt, dtype=np.uint8)
         self._enc_buf  = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=enc_np)
         self._salt_buf = cl.Buffer(self._ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=salt_np)
 
-        # Password and length buffers are reused each batch to avoid repeated
-        # allocation of 128 MB (batch_size * PW_STRIDE).
-        self._pw_buf    = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * PW_STRIDE)
-        self._len_buf   = cl.Buffer(self._ctx, mf.READ_ONLY,  batch_size * 4)
-        # Single uint output: 0 = not found; N = (gid+1) of the matching password.
+        # ALLOC_HOST_PTR pins the transfer buffer in page-locked host memory,
+        # allowing the DMA engine to move data without OS-level staging copies.
+        self._pw_buf    = cl.Buffer(self._ctx, mf.READ_ONLY  | mf.ALLOC_HOST_PTR, batch_size * PW_STRIDE)
+        self._len_buf   = cl.Buffer(self._ctx, mf.READ_ONLY  | mf.ALLOC_HOST_PTR, batch_size * 4)
         self._found_buf = cl.Buffer(self._ctx, mf.READ_WRITE, 4)
         self._found_np  = np.zeros(1, dtype=np.uint32)
 
-    # Context manager so GPU buffers get released on the way out even if
-    # something throws, instead of waiting on the garbage collector.
-    def __enter__(self) -> "GPUEngine":
-        return self
-
-    def __exit__(self, *_) -> None:
-        for buf in (self._pw_buf, self._len_buf, self._found_buf,
-                    self._enc_buf, self._salt_buf):
-            buf.release()
-
-    def check_batch(self, passwords: List[str]) -> Optional[str]:
+    def check_batch(self, passwords):
         """Check a list of password strings on the GPU.
         Returns the found password string, or None."""
-        n = len(passwords)
-        stride = PW_STRIDE
+        n_actual = len(passwords)
+        stride   = PW_STRIDE
 
-        # Pack passwords into a flat byte buffer.  We use a bytearray (not a 2D
-        # numpy array) because numpy's per-row frombuffer calls add Python overhead
-        # for each password.  A single bytearray write followed by one np.frombuffer
-        # call is ~2x faster for large batches.
-        raw = bytearray(n * stride)
+        # Pad global size to a multiple of LOCAL_SIZE (required for explicit local_size).
+        # Extra slots get pw_len=0 so the kernel ignores them.
+        n = ((n_actual + LOCAL_SIZE - 1) // LOCAL_SIZE) * LOCAL_SIZE
+
+        raw     = bytearray(n * stride)   # zero-filled; padded entries have len=0
         len_arr = np.zeros(n, dtype=np.uint32)
         for i, pw in enumerate(passwords):
-            # ascii not utf-8: passwords are always ASCII; utf-8 adds
-            # unnecessary overhead and can produce multi-byte sequences
-            # for non-ASCII chars that the kernel doesn't expect.
             pb = pw.encode("ascii", "ignore")
-            pw_len = len(pb)
-            if pw_len > stride:
-                pw_len = stride
-                pb = pb[:stride]
-            raw[i*stride : i*stride+pw_len] = pb
-            len_arr[i] = pw_len
+            l  = min(len(pb), stride)
+            raw[i*stride : i*stride+l] = pb[:l]
+            len_arr[i] = l
 
         pw_np = np.frombuffer(raw, dtype=np.uint8)
         self._found_np[0] = 0
@@ -664,7 +534,7 @@ class GPUEngine:
         cl.enqueue_copy(self._queue, self._found_buf, self._found_np)
 
         self._kernel(
-            self._queue, (n,), None,
+            self._queue, (n,), (LOCAL_SIZE,),
             self._pw_buf, self._len_buf,
             self._salt_buf, self._enc_buf,
             self._found_buf,
@@ -674,26 +544,15 @@ class GPUEngine:
         self._queue.finish()
 
         if self._found_np[0]:
-            candidate = passwords[self._found_np[0] - 1]
-            if self._wallet.verify_cpu(candidate):
-                return candidate
+            idx = self._found_np[0] - 1
+            if idx < n_actual:
+                candidate = passwords[idx]
+                if self._wallet.verify_cpu(candidate):
+                    return candidate
         return None
 
 # ---------------------------------------------------------------------------
-# Token list parser and password generator
-#
-# Ported from btcrecover's btcrpass.py so we can read the same .txt token list
-# files without modification.  The format is:
-#   - One line per "slot" in the password.
-#   - Tokens on the same line are mutually exclusive (pick one per combination).
-#   - Lines prefixed with "+" are required; all others are optional (a None
-#     placeholder is prepended so they can be skipped).
-#   - Tokens prefixed with "^" or suffixed with "$" are positional anchors.
-#   - "%" introduces a wildcard that expands to many concrete strings at parse time.
-#
-# All combinations of one token per line are generated via itertools.product,
-# then each combination is expanded into all valid permutations of its tokens.
-# Positional anchors override permutation order for specific tokens.
+# Token list parser and password generator (ported from btcrpass.py)
 # ---------------------------------------------------------------------------
 
 class AnchoredToken:
@@ -861,9 +720,7 @@ def parse_tokenlist(filepath):
             else:
                 token_lists.append([None] + tokens) # optional: leading None means "skip"
 
-    # Reverse so that itertools.product cycles the last file line fastest,
-    # matching btcrecover's iteration order (last line = innermost loop).
-    token_lists.reverse()
+    token_lists.reverse()  # btcrecover convention: last line tried first
     return token_lists
 
 
@@ -909,10 +766,7 @@ def _assemble(ordered_tokens):
 
 
 def _count_combo_passwords(tokens):
-    """Count passwords a combo yields without generating them (O(n) per combo).
-    Used by find_combo_position to locate a save-file position without building
-    password strings.  For non-anchored combos this is simply n!; for anchored
-    combos it is (number of free tokens)! since positional tokens don't permute."""
+    """Count passwords a combo yields without generating them (O(n) per combo)."""
     n = len(tokens)
     has_anchors = any(isinstance(t, AnchoredToken) for t in tokens)
     if not has_anchors:
@@ -932,15 +786,7 @@ def _count_combo_passwords(tokens):
 
 def find_combo_position(token_lists, target_skip):
     """Return (combo_idx, skip_in_combo) for a target password count.
-
-    Old save files stored only a linear password count (skip).  To restore
-    quickly we need to convert that count into a (combo_idx, perm_offset) pair
-    so password_generator can use itertools.islice to jump to the right product
-    combo at C speed rather than iterating through millions of passwords in Python.
-
-    This function does that conversion: it iterates the product in C (fast),
-    calling _count_combo_passwords() for each combo (O(n), no string building),
-    and stops when the cumulative count reaches target_skip."""
+    Iterates product at C speed, counting per combo without building strings."""
     count = 0
     last_idx = 0
     for combo_idx, combo in enumerate(itertools.product(*token_lists)):
@@ -959,20 +805,10 @@ def find_combo_position(token_lists, target_skip):
 
 def password_generator(token_lists, start_combo=0, skip_in_combo=0):
     """Yields (combo_idx, pw_in_combo, password).
-
-    combo_idx and pw_in_combo are tracked so save_state() can record the exact
-    position without counting passwords; on restore, start_combo allows us to
-    jump to that position using itertools.islice (pure C, much faster than
-    replaying all the Python generator logic from the start).
-
-    start_combo: product iterator is advanced to this index at C speed via islice.
-    skip_in_combo: passwords to skip within the first resumed combo (handles the
-                   case where a save happened mid-combo)."""
+    start_combo: product iterator is advanced to this index at C speed.
+    skip_in_combo: passwords to skip within the first combo."""
     product_iter = itertools.product(*token_lists)
     if start_combo > 0:
-        # islice advances the C-level product iterator without running any
-        # Python generation code, which is what makes restore fast compared
-        # to iterating through skip_count passwords one at a time.
         for _ in itertools.islice(product_iter, start_combo):
             pass
 
@@ -1031,67 +867,29 @@ def password_generator(token_lists, start_combo=0, skip_in_combo=0):
 
 # ---------------------------------------------------------------------------
 # Save / restore
-#
-# SaveState is a dataclass, not a raw dict, so the fields are named and typed and
-# a mistyped key gets caught up front.
-#
-# We save combo_idx + perm_idx alongside the plain password count (skip_count).
-# skip_count is kept for display and for reading old saves that predate combo_idx.
-# combo_idx + perm_idx is what makes restore fast: islice to the right combo at C
-# speed, then skip perm_idx permutations inside it.
-#
-# Autosave fires every 30 seconds so at most 30 seconds of progress can be lost
-# on an ungraceful exit (Ctrl+C during a kernel call, power loss, etc.).
 # ---------------------------------------------------------------------------
 
-@dataclass
-class SaveState:
-    skip:      int
-    combo_idx: int
-    perm_idx:  int
-    tokenlist: str
-    wallet:    str
-
-def save_state(path: str, skip_count: int, combo_idx: int, perm_idx: int,
-               tokenlist_path: str, wallet_path: str) -> None:
-    state = SaveState(
-        skip      = skip_count,
-        combo_idx = combo_idx,
-        perm_idx  = perm_idx,
-        tokenlist = tokenlist_path,
-        wallet    = wallet_path,
-    )
+def save_state(path, skip_count, combo_idx, perm_idx, tokenlist_path, wallet_path):
+    state = {
+        "skip":      skip_count,
+        "combo_idx": combo_idx,
+        "perm_idx":  perm_idx,
+        "tokenlist": tokenlist_path,
+        "wallet":    wallet_path,
+    }
     with open(path, "wb") as f:
         pickle.dump(state, f)
 
-def load_state(path: str) -> SaveState:
+def load_state(path):
     with open(path, "rb") as f:
-        raw = pickle.load(f)
-    # Handle old dict-format saves (before SaveState dataclass was introduced)
-    if isinstance(raw, dict):
-        return SaveState(
-            skip      = raw.get("skip", 0),
-            combo_idx = raw.get("combo_idx", 0),
-            perm_idx  = raw.get("perm_idx",  0),
-            tokenlist = raw.get("tokenlist", ""),
-            wallet    = raw.get("wallet",    ""),
-        )
-    return raw
+        return pickle.load(f)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def _batch_producer(gen, batch_size, q):
-    """Background thread: pulls passwords from the generator and queues batches.
-
-    Running generation in a separate thread lets the CPU build batch N+1 while
-    the main thread is transferring and processing batch N on the GPU.  Without
-    this overlap, the GPU would be idle during the entire generation phase.
-
-    Queue maxsize=2 means at most one prefetched batch sits in memory waiting.
-    Larger values would pre-generate more but waste memory and don't help since
-    the GPU processes each batch faster than the CPU generates the next one."""
+    """Background thread: pulls (combo_idx, pw_in_combo, pw) from gen, queues batches."""
     batch_pws  = []
     last_combo = 0
     last_perm  = 0
@@ -1124,12 +922,12 @@ def main():
     start_perm     = 0
 
     if args.restore:
-        state          = load_state(args.restore)  # returns SaveState dataclass
-        skip_count     = state.skip
-        tokenlist_path = state.tokenlist
-        wallet_path    = state.wallet
-        start_combo    = state.combo_idx or None   # 0 treated as "not set" for migration
-        start_perm     = state.perm_idx
+        state = load_state(args.restore)
+        skip_count     = state["skip"]
+        tokenlist_path = state["tokenlist"]
+        wallet_path    = state["wallet"]
+        start_combo    = state.get("combo_idx")   # None if old-format save
+        start_perm     = state.get("perm_idx", 0)
         print(f"Restored from {args.restore}, resuming at password #{skip_count:,}")
 
     if not wallet_path or not tokenlist_path:
@@ -1138,18 +936,7 @@ def main():
     wallet      = WalletMultiBit.load(wallet_path)
     token_lists = parse_tokenlist(tokenlist_path)
     batch_size  = args.batch_size
-
-    # 'with' ensures GPU buffers are released even if an exception occurs,
-    # rather than relying on the garbage collector to eventually call __del__.
-    with GPUEngine(wallet, batch_size) as engine:
-      _run_search(engine, args, token_lists, wallet_path, tokenlist_path,
-                  skip_count, start_combo, start_perm)
-
-
-def _run_search(engine, args, token_lists, wallet_path, tokenlist_path,
-                skip_count, start_combo, start_perm):
-    """Inner search loop, separated so GPUEngine 'with' block is clean."""
-    batch_size = engine._batch_size
+    engine      = GPUEngine(wallet, batch_size)
 
     # Old save files only store skip_count, not combo_idx.
     # Run a fast counting pass (no string building) to locate the combo position.
