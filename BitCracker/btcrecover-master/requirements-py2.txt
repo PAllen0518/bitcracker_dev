@@ -1,0 +1,8 @@
+# Pinned dependencies for the Python 2.7 CPU typo-recovery tool (btcrecover.py).
+# Python 2.7 hit end-of-life in January 2020, and PyCrypto has been unmaintained
+# since ~2013 (see audit/dependency-management.md finding 3). Pinning here just
+# fixes the version for reproducibility; it doesn't fix that underlying risk.
+# Moving this tool to Python 3 + pycryptodome would drop both EOL dependencies.
+# Install with:
+#   C:\python27\python -m pip install -r requirements-py2.txt
+pycrypto==2.6.1

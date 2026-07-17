@@ -1,0 +1,6 @@
+# Pinned dependencies for the Python 3 GPU tool (multibit_gpu.py, multibit_gpu_2.py).
+# Tested with Python 3.10.3 on Windows. Install with:
+#   pip install -r requirements-py3.txt
+pyopencl==2024.2.2
+numpy==1.26.4
+pycryptodome==3.14.1

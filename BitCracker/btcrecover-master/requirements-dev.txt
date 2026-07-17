@@ -1,0 +1,5 @@
+# Development/test dependencies for the Python 3 tooling. Install with:
+#   pip install -r requirements-dev.txt
+pytest>=8.0
+ruff>=0.6.0
+pycryptodome>=3.20
