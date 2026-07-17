@@ -1,4 +1,4 @@
-multibit_cuda_threads — GPU-Accelerated MultiBit Classic Password Recovery
+multibit_cuda_threads - GPU-Accelerated MultiBit Classic Password Recovery
 ==========================================================================
 
 OVERVIEW
@@ -24,15 +24,15 @@ Architecture:
   - The two overlap: GPU checks batch N while CPU fills batch N+1
 
 Why char arrays, not std::string:
-  std::string allocates on the heap per object.  In the hot loop that means
-  malloc/free per password — at 11M passwords/sec that would be 11M malloc
-  calls/sec.  Stack char arrays eliminate all allocations from the critical path.
+  std::string allocates on the heap per object. In the hot loop that's a
+  malloc/free per password, which at 11M/s means 11M malloc calls a second.
+  Stack char arrays keep the critical path allocation-free.
 
 Why C++ host generation, not GPU-side generation:
-  GPU-side generation (multibit_cuda.cu) used nth_permutation — O(n^2) with
-  divergent control flow across threads.  For n=9 free tokens it's slower than
-  just sending pre-built strings from the CPU.  C++ std::next_permutation is
-  O(n) per step and runs without the divergence penalty.
+  GPU-side generation (multibit_cuda.cu) used nth_permutation: O(n^2) with
+  divergent control flow across threads. For n=9 free tokens that's slower than
+  just sending pre-built strings from the CPU. C++ std::next_permutation is O(n)
+  per step and has no divergence penalty.
 
 
 BUILDING
@@ -58,6 +58,13 @@ Options:
   --tokenlist <file>   btcrecover-compatible token list file
   --autosave  <file>   Save progress every 30 seconds (.bin extension)
   --restore   <file>   Resume from a save file
+  --delimiter <char>   Token separator (default space); use e.g. a comma when a
+                       token needs to contain a literal space
+  --typos     <N>      Generate up to N typos per base password, combined with:
+                       --typos-capslock, --typos-swap, --typos-repeat,
+                       --typos-delete, --typos-closecase, --typos-insert <chars>
+                       (typo generation is slower than the base search; use it on
+                       a small set of close candidates, not a full sweep)
 
 
 SAVE FORMAT
@@ -65,8 +72,8 @@ SAVE FORMAT
 Binary SaveState struct (compatible with multibit_cuda.exe saves):
   tokenlist path, wallet path, combo_idx (uint64), total_combos, passwords_checked
 
-Save uses combo_idx not password count — restore jumps directly to the right
-combo in O(combo_idx) C++ operations (microseconds, not hours).
+Save uses combo_idx, not a password count, so restore jumps straight to the
+right combo in O(combo_idx) C++ operations (microseconds, not hours).
 
 
 TOKEN LIST FORMAT
@@ -94,13 +101,15 @@ Valid password → Bitcoin WIF private key:
   byte[0] in {L, K, 5, Q}  and  all 32 bytes are valid base58 chars.
 
 Early rejection after block 1 (first 16 bytes) rejects 98.4% of wrong
-passwords before decrypting block 2.  Any GPU hit is CPU-verified before
+passwords before decrypting block 2. Any GPU hit is CPU-verified before
 being reported.
 
 
 KNOWN LIMITATIONS
 -----------------
-- No typos support (--typos-* flags)
 - Middle anchors (^N,M^) not implemented
 - Digit wildcard only (%0,4d); other wildcard types ignored
-- Found password is printed directly from the batch buffer (correct and working)
+- typos-replace and typos-map are not ported (typos-capslock/swap/repeat/
+  delete/closecase/insert are)
+- A found password is written to RECOVERED_PASSWORD.txt (owner read/write),
+  not printed to the terminal

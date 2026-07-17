@@ -1,32 +1,20 @@
 /*
- * multibit_cuda_threads.cu  -  C++ host generation + CUDA GPU checking
+ * multibit_cuda_threads.cu - password generation on the CPU, crypto check on the GPU.
  *
- * Measured throughput (RTX 2060, search46.txt):
- *   Python + OpenCL (multibit_gpu.py)  :   ~500K passwords/sec  (CPU bottleneck)
- *   CUDA GPU-side gen (multibit_cuda.cu):   ~277K passwords/sec  (nth_permutation overhead)
- *   This file, with std::string assembly :  ~3M   passwords/sec
- *   This file, with char array assembly  :  ~11M  passwords/sec  <-- current
+ * The CPU walks the tokenlist and assembles candidate passwords; the GPU does the
+ * MultiBit check (3x MD5 + AES + base58) one thread per password. A producer thread
+ * fills the next batch while the GPU works on the current one. About 11M pw/s on a
+ * 2060.
  *
- * Architecture:
- *   multibit_cuda.cu generated passwords on the GPU using nth_permutation — O(n^2)
- *   with thread divergence, making it slower than Python.  This version generates
- *   on the CPU in C++ using std::next_permutation (O(n) per step, no divergence)
- *   and sends complete password strings to the GPU for the crypto check only.
+ * The earlier approach (multibit_cuda.cu) generated passwords on the GPU with
+ * nth_permutation and was slower than Python thanks to the O(n^2) indexing and
+ * thread divergence. Moving generation back to the CPU and only shipping finished
+ * strings to the GPU was the fix. The other big win was dropping std::string in the
+ * assembly loop for stack char arrays - that alone took it from ~3M to ~11M.
  *
- *   The initial C++ version used std::string and std::vector in the hot loop,
- *   which caused a heap allocation per password.  Replacing these with stack-
- *   allocated char arrays (assemble_password_fast) eliminated the allocation
- *   overhead and raised throughput from 3M to 11M passwords/sec.
- *
- *   A background producer thread fills batches while the main thread runs the
- *   GPU kernel, fully overlapping CPU generation with GPU computation.
- *
- * Compile:
- *   build_cuda.bat
- *
- * Usage:
- *   multibit_cuda_threads.exe --wallet multi.key --tokenlist search46.txt --autosave save.bin
- *   multibit_cuda_threads.exe --restore save.bin
+ * Build:  build_cuda.bat
+ * Run:    multibit_cuda_threads.exe --wallet multi.key --tokenlist search46.txt --autosave save.bin
+ *         multibit_cuda_threads.exe --restore save.bin
  */
 
 #include <stdio.h>
@@ -47,6 +35,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 
 using hrclock     = std::chrono::steady_clock;
 using hrtimepoint = hrclock::time_point;
@@ -54,23 +43,13 @@ static inline double secs_since(hrtimepoint t0) {
     return std::chrono::duration<double>(hrclock::now() - t0).count();
 }
 
-// ---------------------------------------------------------------------------
-// CUDA error checking (C++ Core Guidelines I.10: signal every failure)
-//
-// Every CUDA API call returns an error code that was previously ignored,
-// meaning a failed cudaMalloc or bad kernel launch would silently produce
-// wrong results or a null-pointer crash with no diagnosis.  CUDA_CHECK wraps
-// each call and aborts immediately with a clear message on any failure.
-//
-// cudaGetLastError() is called after each kernel launch because launch
-// configuration errors (wrong block size, insufficient shared memory) are
-// reported asynchronously — they won't appear until the next synchronisation
-// unless explicitly checked.
-// ---------------------------------------------------------------------------
+// Wrap every CUDA call so a failed malloc or bad launch aborts loudly instead
+// of silently corrupting results. Kernel launch errors are async, so the launch
+// sites also check cudaGetLastError() explicitly.
 #define CUDA_CHECK(call) do {                                                  \
     cudaError_t _e = (call);                                                   \
     if (_e != cudaSuccess) {                                                   \
-        fprintf(stderr, "\nCUDA error at %s:%d — %s\n",                       \
+        fprintf(stderr, "\nCUDA error at %s:%d: %s\n",                         \
                 __FILE__, __LINE__, cudaGetErrorString(_e));                   \
         exit(1);                                                               \
     }                                                                          \
@@ -83,11 +62,8 @@ static inline double secs_since(hrtimepoint t0) {
 #define BATCH_SIZE     (1 << 20)   // 1M passwords per GPU launch
 #define PW_STRIDE      128         // fixed bytes per password slot
 
-// Compile-time invariant: PW_STRIDE must be a power of two so that
-// gid * PW_STRIDE never produces misaligned accesses on the GPU.
-// This replaces the (pointer, size) anti-pattern that the C++ Core
-// Guidelines flag: the size is baked into the type rather than passed
-// alongside the pointer and trusted to match at runtime.
+// PW_STRIDE must be a power of two, otherwise gid * PW_STRIDE can land on a
+// misaligned address in the kernel.
 static_assert((PW_STRIDE & (PW_STRIDE - 1)) == 0,
               "PW_STRIDE must be a power of two");
 #define MAX_LINES      16
@@ -541,28 +517,13 @@ struct Batch {
     bool full() const { return count>=BATCH_SIZE; }
 };
 
-// ---------------------------------------------------------------------------
-// Host: password generator using std::next_permutation
-//
-// For each product combination, we collect free tokens, sort their indices,
-// then iterate all permutations using std::next_permutation (O(n) per step).
-// This is ~100x faster than Python's itertools.permutations because:
-//   1. No Python interpreter overhead
-//   2. Operating on integers (indices), not strings
-//   3. next_permutation is highly optimized in the C++ standard library
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Fast password assembly — zero heap allocation in the hot path.
-//
-// Instead of std::string and std::vector per call (each a heap allocation),
-// we use stack-allocated arrays of const char* pointers into the token
-// strings that already live in the TokenLine.tokens vector.  Token lengths
-// are passed alongside the pointers so we never call strlen().
-//
-// Benchmark: replacing std::string assembly raised throughput from ~3M/s
-// to ~15-30M/s by eliminating malloc/free on every password.
-// ---------------------------------------------------------------------------
+// Password assembly. For each combination we collect the free tokens and run
+// std::next_permutation over their indices (not the strings), which keeps the
+// inner loop working on ints. Everything below stays on the stack: the slot
+// tables are fixed-size arrays of pointers into the token strings that already
+// live in TokenLine.tokens, and lengths travel alongside so there's no strlen.
+// Keeping this allocation-free in the hot path is what gets us to ~11M/s;
+// the std::string version sat around 3M.
 
 struct AnchorSlot {
     int         pos;   // 0-indexed slot position; -1 = last
@@ -581,7 +542,7 @@ static inline void assemble_password_fast(
     int total = n_free + n_anchored;
     if (total == 0) { out[0]=0; *out_len=0; return; }
 
-    // Stack slot table — no heap allocation
+    // Stack slot table, no heap allocation
     const char* slots[MAX_FREE + MAX_ANCHORED] = {};
     int         slens[MAX_FREE + MAX_ANCHORED] = {};
     bool        taken[MAX_FREE + MAX_ANCHORED] = {};
@@ -617,6 +578,256 @@ static inline void assemble_password_fast(
     *out_len = pos;
 }
 
+// Typo generation, ported from btcrecover (btcrpass.py's capslock/swap/simple/
+// insert typo generators). Stages run in btcrecover's order - capslock, swap,
+// simple (repeat/delete/closecase), insert - and share one --typos N budget, so
+// the output is every way of spreading up to N typos across the enabled stages.
+// btcrecover threads the budget through chained Python generators; this does the
+// same thing with plain recursion. The variant set matches.
+//
+// This path uses std::string/vector/function and allocates freely, unlike the
+// base assembly loop. That's fine: typos are for hammering on a small set of
+// near-miss candidates, not for driving the full tokenlist search.
+
+struct TypoConfig {
+    int  max_typos        = 0;
+    bool capslock         = false;
+    bool swap             = false;
+    int  max_typos_swap   = 1000000;
+    bool repeat           = false;
+    bool del              = false;
+    bool closecase        = false;
+    int  max_typos_simple = 1000000;
+    bool insert           = false;
+    int  max_typos_insert = 1000000;
+    std::string insert_charset;
+
+    bool any() const { return capslock || swap || repeat || del || closecase || insert; }
+};
+
+struct TypoCandidate {
+    std::string pw;
+    int typos_used;
+};
+
+static inline char swap_case_ch(char c) {
+    if (c>='A'&&c<='Z') return char(c - 'A' + 'a');
+    if (c>='a'&&c<='z') return char(c - 'a' + 'A');
+    return c;
+}
+static std::string swapcase_str(const std::string& s) {
+    std::string r = s;
+    for (auto& c : r) c = swap_case_ch(c);
+    return r;
+}
+// 0 = uncased, 1 = upper, 2 = lower
+static inline int case_id_ch(char c) {
+    if (c>='A'&&c<='Z') return 1;
+    if (c>='a'&&c<='z') return 2;
+    return 0;
+}
+// closecase only flips a letter that sits next to a case change (or at either
+// end): the shift-held-a-beat-too-long typo, rather than a case flip anywhere.
+static bool is_case_transition(const std::string& pw, int i) {
+    int cur = case_id_ch(pw[i]);
+    if (cur == 0) return false;
+    if (i == 0 || i+1 == (int)pw.size()) return true;
+    int prev = case_id_ch(pw[i-1]);
+    int next = case_id_ch(pw[i+1]);
+    return (prev != 0 && prev != cur) || (next != 0 && next != cur);
+}
+
+static void typo_stage_capslock(const std::vector<TypoCandidate>& in, const TypoConfig& cfg,
+                                 std::vector<TypoCandidate>& out) {
+    for (auto& c : in) {
+        out.push_back(c);
+        if (cfg.capslock && c.typos_used < cfg.max_typos) {
+            std::string sw = swapcase_str(c.pw);
+            if (sw != c.pw) out.push_back({sw, c.typos_used + 1});
+        }
+    }
+}
+
+// Choose `remaining` more non-overlapping adjacent-pair indexes from
+// [start, len-2], applying each complete selection to `base` and emitting it.
+static void swap_combinations(const std::string& base, int len, int start, int remaining,
+                               std::vector<int>& chosen, int typos_used,
+                               std::vector<TypoCandidate>& out) {
+    if (remaining == 0) {
+        std::string pw = base;
+        for (size_t k = 0; k < chosen.size(); k++) {
+            int i = chosen[k];
+            if (pw[i] == pw[i+1]) return;  // no-op swap, matches btcrecover's dup avoidance
+            std::swap(pw[i], pw[i+1]);
+        }
+        out.push_back({pw, typos_used + (int)chosen.size()});
+        return;
+    }
+    for (int i = start; i <= len - 2; i++) {
+        if (!chosen.empty() && i == chosen.back() + 1) continue;  // would re-swap a char
+        chosen.push_back(i);
+        swap_combinations(base, len, i + 1, remaining - 1, chosen, typos_used, out);
+        chosen.pop_back();
+    }
+}
+
+static void typo_stage_swap(const std::vector<TypoCandidate>& in, const TypoConfig& cfg,
+                             std::vector<TypoCandidate>& out) {
+    for (auto& c : in) {
+        out.push_back(c);
+        if (!cfg.swap) continue;
+        int len = (int)c.pw.size();
+        int budget = std::min({cfg.max_typos - c.typos_used, cfg.max_typos_swap, len / 2});
+        for (int k = 1; k <= budget; k++) {
+            std::vector<int> chosen;
+            swap_combinations(c.pw, len, 0, k, chosen, c.typos_used, out);
+        }
+    }
+}
+
+// Choose `remaining` more distinct positions from [start, len), then cross
+// every enabled simple-typo option at each chosen position. If any position
+// has no valid option (e.g. closecase away from a case boundary), the whole
+// combination produces nothing.
+static void simple_positions(const std::string& base, int len, int start, int remaining,
+                              std::vector<int>& chosen, const TypoConfig& cfg,
+                              int typos_used, std::vector<TypoCandidate>& out) {
+    if (remaining == 0) {
+        int k = (int)chosen.size();
+        std::vector<std::vector<std::string>> options(k);
+        for (int j = 0; j < k; j++) {
+            int i = chosen[j];
+            auto& opts = options[j];
+            if (cfg.repeat) opts.push_back(std::string(2, base[i]));
+            if (cfg.del)    opts.push_back(std::string());
+            if (cfg.closecase && is_case_transition(base, i)) {
+                char sc = swap_case_ch(base[i]);
+                if (sc != base[i]) opts.push_back(std::string(1, sc));
+            }
+            if (opts.empty()) return;
+        }
+        std::vector<int> sel(k, 0);
+        std::function<void(int)> cross = [&](int pos) {
+            if (pos == k) {
+                std::string pw;
+                pw.reserve(len + k);
+                int prev = 0;
+                for (int j = 0; j < k; j++) {
+                    pw += base.substr(prev, chosen[j] - prev);
+                    pw += options[j][sel[j]];
+                    prev = chosen[j] + 1;
+                }
+                pw += base.substr(prev);
+                out.push_back({pw, typos_used + k});
+                return;
+            }
+            for (int o = 0; o < (int)options[pos].size(); o++) { sel[pos] = o; cross(pos + 1); }
+        };
+        cross(0);
+        return;
+    }
+    for (int i = start; i < len; i++) {
+        chosen.push_back(i);
+        simple_positions(base, len, i + 1, remaining - 1, chosen, cfg, typos_used, out);
+        chosen.pop_back();
+    }
+}
+
+static void typo_stage_simple(const std::vector<TypoCandidate>& in, const TypoConfig& cfg,
+                               std::vector<TypoCandidate>& out) {
+    bool any_simple = cfg.repeat || cfg.del || cfg.closecase;
+    for (auto& c : in) {
+        out.push_back(c);
+        if (!any_simple) continue;
+        int len = (int)c.pw.size();
+        int budget = std::min({cfg.max_typos - c.typos_used, cfg.max_typos_simple, len});
+        for (int k = 1; k <= budget; k++) {
+            std::vector<int> chosen;
+            simple_positions(c.pw, len, 0, k, chosen, cfg, c.typos_used, out);
+        }
+    }
+}
+
+// Choose `remaining` more insertion points from [start, len] (positions may
+// repeat, i.e. more than one character can be inserted at the same point),
+// then cross every charset character at each chosen point and emit the
+// resulting password.
+static void insert_positions(const std::string& base, int len, int start, int remaining,
+                              std::vector<int>& chosen, const TypoConfig& cfg,
+                              int typos_used, std::vector<TypoCandidate>& out) {
+    if (remaining == 0) {
+        int k = (int)chosen.size();
+        int csn = (int)cfg.insert_charset.size();
+        std::vector<int> sel(k, 0);
+        std::function<void(int)> cross = [&](int pos) {
+            if (pos == k) {
+                std::string pw;
+                pw.reserve(len + k);
+                int prev = 0;
+                for (int j = 0; j < k; j++) {
+                    pw += base.substr(prev, chosen[j] - prev);
+                    pw += cfg.insert_charset[sel[j]];
+                    prev = chosen[j];
+                }
+                pw += base.substr(prev);
+                out.push_back({pw, typos_used + k});
+                return;
+            }
+            for (int o = 0; o < csn; o++) { sel[pos] = o; cross(pos + 1); }
+        };
+        cross(0);
+        return;
+    }
+    for (int i = start; i <= len; i++) {
+        chosen.push_back(i);
+        insert_positions(base, len, i, remaining - 1, chosen, cfg, typos_used, out);
+        chosen.pop_back();
+    }
+}
+
+static void typo_stage_insert(const std::vector<TypoCandidate>& in, const TypoConfig& cfg,
+                               std::vector<TypoCandidate>& out) {
+    for (auto& c : in) {
+        out.push_back(c);
+        if (!cfg.insert || cfg.insert_charset.empty()) continue;
+        int len = (int)c.pw.size();
+        int budget = std::min({cfg.max_typos - c.typos_used, cfg.max_typos_insert, len + 1});
+        for (int k = 1; k <= budget; k++) {
+            std::vector<int> chosen;
+            insert_positions(c.pw, len, 0, k, chosen, cfg, c.typos_used, out);
+        }
+    }
+}
+
+// Top-level: applies all enabled typo stages, in btcrecover's fixed order,
+// to a single base password, sharing the --typos N budget across all of
+// them. Returns every variant, including the unmodified original (0 typos).
+static std::vector<TypoCandidate> generate_typo_variants(const std::string& base_pw,
+                                                           const TypoConfig& cfg) {
+    std::vector<TypoCandidate> stage{ {base_pw, 0} };
+    if (cfg.capslock) {
+        std::vector<TypoCandidate> next;
+        typo_stage_capslock(stage, cfg, next);
+        stage = std::move(next);
+    }
+    if (cfg.swap) {
+        std::vector<TypoCandidate> next;
+        typo_stage_swap(stage, cfg, next);
+        stage = std::move(next);
+    }
+    if (cfg.repeat || cfg.del || cfg.closecase) {
+        std::vector<TypoCandidate> next;
+        typo_stage_simple(stage, cfg, next);
+        stage = std::move(next);
+    }
+    if (cfg.insert) {
+        std::vector<TypoCandidate> next;
+        typo_stage_insert(stage, cfg, next);
+        stage = std::move(next);
+    }
+    return stage;
+}
+
 // ---------------------------------------------------------------------------
 // Producer thread: generates passwords and fills batch buffers
 // ---------------------------------------------------------------------------
@@ -625,6 +836,7 @@ struct ProducerState {
     const std::vector<TokenLine>* lines;
     uint64_t start_combo;
     uint64_t total_combos;
+    const TypoConfig*       typo_cfg = nullptr;  // nullptr or !any() => no typo generation
 
     std::mutex              mtx;
     std::condition_variable cv_ready;    // signals main thread: batch is ready
@@ -668,8 +880,7 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         cur->passwords_total = next_base;
     };
 
-    // Stack-allocated hot-path buffers — reused across all combos and permutations.
-    // No heap allocation in the inner loop.
+    // Hot-path buffers, reused across every combo and permutation.
     const char* free_ptrs[MAX_FREE];
     int         free_lens[MAX_FREE];
     AnchorSlot  anchors[MAX_ANCHORED];
@@ -688,11 +899,24 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         if (cur->full()) push_batch();
     };
 
+    // Sibling of add_password() for typo variants, which are std::strings
+    // (heap-allocated during generation) rather than the stack pw_buf.
+    auto add_password_str = [&](const std::string& s, uint64_t cidx) {
+        if (s.empty() || (int)s.size() > PW_MAX_LEN) return;
+        int slot = cur->count;
+        uint8_t* dst = cur->pw_data.data() + slot * PW_STRIDE;
+        memcpy(dst, s.data(), s.size());
+        cur->pw_lens[slot] = (uint32_t)s.size();
+        cur->combo_idx = cidx;
+        cur->count++;
+        if (cur->full()) push_batch();
+    };
+
     // Iterate all combos from start_combo to total_combos
     for (; combo_idx < state->total_combos; combo_idx++) {
 
-        // Decode this combo into free tokens and anchored tokens.
-        // All pointers are into existing std::string storage — no copies.
+        // Decode this combo into free and anchored tokens. Pointers reference
+        // the token strings directly, nothing is copied here.
         int n_free = 0, n_anchored = 0;
         bool valid = true;
 
@@ -719,15 +943,18 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         }
 
         if (valid && n_free > 0) {
-            // Initialise permutation indices [0, 1, ..., n_free-1].
-            // std::next_permutation generates all n_free! orderings, one per step,
-            // in O(n) amortised time — far cheaper than Python's full tuple build.
+            // Walk all n_free! orderings, one per next_permutation step.
             for (int i=0;i<n_free;i++) perm[i]=i;
             do {
                 assemble_password_fast(free_ptrs, free_lens, n_free,
                                        anchors, n_anchored, perm,
                                        pw_buf, &pw_len);
-                add_password(combo_idx);
+                if (state->typo_cfg && state->typo_cfg->any()) {
+                    for (auto& v : generate_typo_variants(std::string(pw_buf, pw_len), *state->typo_cfg))
+                        add_password_str(v.pw, combo_idx);
+                } else {
+                    add_password(combo_idx);
+                }
             } while (std::next_permutation(perm, perm + n_free));
         }
 
@@ -748,7 +975,7 @@ static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
         state->done = true;
         state->cv_ready.notify_all();
     }
-    // cur is a unique_ptr — freed automatically here
+    // cur is a unique_ptr, freed automatically here
 }
 
 
@@ -866,13 +1093,26 @@ int main(int argc, char** argv) {
     const char* autosave_path  = nullptr;
     const char* restore_path   = nullptr;
     char        delimiter      = ' ';
+    TypoConfig  typo_cfg;
 
     for (int i=1;i<argc;i++) {
-        if      (!strcmp(argv[i],"--wallet")    && i+1<argc) wallet_path    = argv[++i];
-        else if (!strcmp(argv[i],"--tokenlist") && i+1<argc) tokenlist_path = argv[++i];
-        else if (!strcmp(argv[i],"--autosave")  && i+1<argc) autosave_path  = argv[++i];
-        else if (!strcmp(argv[i],"--restore")   && i+1<argc) restore_path   = argv[++i];
-        else if (!strcmp(argv[i],"--delimiter") && i+1<argc) delimiter      = argv[++i][0];
+        if      (!strcmp(argv[i],"--wallet")           && i+1<argc) wallet_path           = argv[++i];
+        else if (!strcmp(argv[i],"--tokenlist")        && i+1<argc) tokenlist_path        = argv[++i];
+        else if (!strcmp(argv[i],"--autosave")         && i+1<argc) autosave_path         = argv[++i];
+        else if (!strcmp(argv[i],"--restore")          && i+1<argc) restore_path          = argv[++i];
+        else if (!strcmp(argv[i],"--delimiter")        && i+1<argc) delimiter             = argv[++i][0];
+        else if (!strcmp(argv[i],"--typos")            && i+1<argc) typo_cfg.max_typos    = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--typos-capslock"))                typo_cfg.capslock    = true;
+        else if (!strcmp(argv[i],"--typos-swap"))                    typo_cfg.swap        = true;
+        else if (!strcmp(argv[i],"--max-typos-swap")   && i+1<argc) typo_cfg.max_typos_swap   = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--typos-repeat"))                  typo_cfg.repeat      = true;
+        else if (!strcmp(argv[i],"--typos-delete"))                  typo_cfg.del         = true;
+        else if (!strcmp(argv[i],"--typos-closecase"))               typo_cfg.closecase   = true;
+        else if (!strcmp(argv[i],"--typos-insert")     && i+1<argc) { typo_cfg.insert = true; typo_cfg.insert_charset = argv[++i]; }
+        else if (!strcmp(argv[i],"--max-typos-insert") && i+1<argc) typo_cfg.max_typos_insert = atoi(argv[++i]);
+    }
+    if (typo_cfg.any() && typo_cfg.max_typos <= 0) {
+        fprintf(stderr, "--typos-* flags given without --typos N (N > 0); no typos will be generated.\n");
     }
 
     SaveState state = {};
@@ -889,6 +1129,9 @@ int main(int argc, char** argv) {
     }
     if (!wallet_path || !tokenlist_path) {
         fprintf(stderr,"Usage: multibit_cuda_threads.exe --wallet <f> --tokenlist <f> [--autosave <f>]\n"
+                       "                                  [--delimiter <c>] [--typos N [--typos-capslock]\n"
+                       "                                  [--typos-swap] [--typos-repeat] [--typos-delete]\n"
+                       "                                  [--typos-closecase] [--typos-insert <charset>]]\n"
                        "       multibit_cuda_threads.exe --restore <save.bin>\n");
         return 1;
     }
@@ -933,6 +1176,11 @@ int main(int argc, char** argv) {
     ps.lines        = &lines;
     ps.start_combo  = state.combo_idx;
     ps.total_combos = total_combos;
+    ps.typo_cfg     = &typo_cfg;
+    if (typo_cfg.any() && typo_cfg.max_typos > 0)
+        printf("Typos enabled: budget %d (capslock=%d swap=%d repeat=%d delete=%d closecase=%d insert=%d)\n",
+               typo_cfg.max_typos, typo_cfg.capslock, typo_cfg.swap, typo_cfg.repeat,
+               typo_cfg.del, typo_cfg.closecase, typo_cfg.insert);
 
     GPUEngine gpu;
     std::thread producer(producer_thread, &ps, state.passwords_checked);
