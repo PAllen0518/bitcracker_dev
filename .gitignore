@@ -11,6 +11,11 @@ settings.json
 /addresses.db
 claude.md
 
+# Python tooling caches
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
 # Sensitive - wallet key files
 *.key
 
@@ -25,6 +30,10 @@ Testsearch.txt
 # Autosave/restore files from btcrecover and GPU recovery runs
 savefile*
 *.pkl
+*_progress_log.csv
+
+# Internal engineering audit (not for publication yet)
+audit/
 
 # Recovered passwords, written to a file instead of stdout (never commit these)
 RECOVERED_PASSWORD.txt
