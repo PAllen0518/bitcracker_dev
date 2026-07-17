@@ -18,6 +18,9 @@ __pycache__/
 
 # Sensitive - wallet key files
 *.key
+# ...except btcrecover's public test fixture (password "btcr-test-password"),
+# which the test suite needs and CI checks out fresh.
+!**/test-wallets/multibit-wallet.key
 
 # Sensitive - personal password/token search lists
 search*.txt
