@@ -1,0 +1,42 @@
+name: CI
+
+# Lints and tests the Python 3 tooling (multibit_check.py + its test suite) on
+# every push and pull request.
+#
+# The CUDA tool (multibit_cuda_threads.cu) is not built here: it needs the CUDA
+# toolkit, MSVC, and Windows-only headers, so it is compiled locally via
+# build_cuda.bat. Its crypto and typo logic are mirrored by the Python tests,
+# which do run in CI.
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  python:
+    name: Lint & test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: BitCracker/btcrecover-master
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check multibit_check.py tests/
+
+      - name: Test (pytest)
+        run: python -m pytest tests/ -v
