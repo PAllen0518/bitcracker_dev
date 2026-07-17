@@ -447,7 +447,7 @@ static std::vector<std::string> expand_digit_wildcard(int min_len, int max_len) 
     return out;
 }
 
-static std::vector<TokenLine> parse_tokenlist(const char* path) {
+static std::vector<TokenLine> parse_tokenlist(const char* path, char delimiter) {
     std::vector<TokenLine> lines;
     FILE* f=fopen(path,"r");
     if (!f) { fprintf(stderr,"Cannot open tokenlist: %s\n",path); exit(1); }
@@ -458,15 +458,17 @@ static std::vector<TokenLine> parse_tokenlist(const char* path) {
 
         TokenLine tl; tl.required=false; tl.has_anchor=false; tl.anchor_pos=0;
         const char* p=line.c_str();
-        if (*p=='+') { tl.required=true; while (*p=='+'||*p==' ') p++; }
-        else while (*p==' ') p++;  // optional line marker (leading space)
+        if (*p=='+') { tl.required=true; while (*p=='+'||*p==delimiter) p++; }
+        else while (*p==delimiter) p++;  // optional line marker (leading delimiter)
 
-        // Split remaining by spaces
+        // Split remaining by the configured delimiter (default: space). A
+        // non-space delimiter frees up literal spaces to live inside a
+        // token's own text, e.g. "I love Freedom" as one atomic value.
         std::string rest(p);
         std::vector<std::string> parts;
         size_t pos=0;
         while (pos<rest.size()) {
-            size_t end=rest.find(' ',pos);
+            size_t end=rest.find(delimiter,pos);
             if (end==std::string::npos) end=rest.size();
             if (end>pos) parts.push_back(rest.substr(pos,end-pos));
             pos=end+1;
@@ -863,12 +865,14 @@ int main(int argc, char** argv) {
     const char* tokenlist_path = nullptr;
     const char* autosave_path  = nullptr;
     const char* restore_path   = nullptr;
+    char        delimiter      = ' ';
 
     for (int i=1;i<argc;i++) {
         if      (!strcmp(argv[i],"--wallet")    && i+1<argc) wallet_path    = argv[++i];
         else if (!strcmp(argv[i],"--tokenlist") && i+1<argc) tokenlist_path = argv[++i];
         else if (!strcmp(argv[i],"--autosave")  && i+1<argc) autosave_path  = argv[++i];
         else if (!strcmp(argv[i],"--restore")   && i+1<argc) restore_path   = argv[++i];
+        else if (!strcmp(argv[i],"--delimiter") && i+1<argc) delimiter      = argv[++i][0];
     }
 
     SaveState state = {};
@@ -895,8 +899,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpyToSymbol(c_enc,  h_enc,  32));
     CUDA_CHECK(cudaMemcpyToSymbol(c_salt, h_salt, 8));
 
-    auto lines = parse_tokenlist(tokenlist_path);
-    printf("Token list: %s (%d lines)\n", tokenlist_path, (int)lines.size());
+    auto lines = parse_tokenlist(tokenlist_path, delimiter);
+    printf("Token list: %s (%d lines, delimiter '%c')\n", tokenlist_path, (int)lines.size(), delimiter);
 
     // Count total combos for progress display
     uint64_t total_combos = 1;
@@ -910,6 +914,18 @@ int main(int argc, char** argv) {
         state.total_combos      = total_combos;
         state.combo_idx         = 0;
         state.passwords_checked = 0;
+    } else if (total_combos != state.total_combos) {
+        // The tokenlist re-parsed to a different combo count than the save file
+        // expects - either the tokenlist was edited, or --delimiter doesn't match
+        // what the original run used. Resuming anyway would silently check the
+        // wrong passwords against a stale combo_idx, so refuse instead.
+        fprintf(stderr,
+            "\nFATAL: re-parsed tokenlist yields %llu combos but the save file expects %llu.\n"
+            "The tokenlist file or --delimiter must have changed since this save was written.\n"
+            "Pass the same --delimiter used originally, and don't edit the tokenlist between\n"
+            "save and restore.\n",
+            (unsigned long long)total_combos, (unsigned long long)state.total_combos);
+        return 1;
     }
 
     // Start producer thread
