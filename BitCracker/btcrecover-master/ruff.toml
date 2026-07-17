@@ -1,0 +1,13 @@
+# Ruff config for the maintained Python 3 code. The vendored btcrecover tree and
+# the Python 2.7 entry point are intentionally excluded: they are upstream code
+# kept for reference, not linted here.
+line-length = 100
+
+extend-exclude = [
+    "btcrecover",       # vendored upstream btcrecover (Python 2)
+    "btcrecover.py",    # legacy Python 2.7 entry point
+    "aespython",
+    "passlib",
+    "progressbar",
+    "python",
+]
