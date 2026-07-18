@@ -29,6 +29,7 @@ Testsearch.txt
 
 # Sensitive - search notes containing candidate passwords (any naming variant)
 *[Ss]earch*[Nn]otes*.txt
+PASSWORD_MEMORY.md
 
 # Autosave/restore files from btcrecover and GPU recovery runs
 savefile*
