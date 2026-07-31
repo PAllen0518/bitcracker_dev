@@ -1,4 +1,4 @@
-multibit_cuda_threads.exe — Build Requirements
+multibit_cuda_threads.exe - Build Requirements
 ===============================================
 
 CUDA Toolkit
@@ -44,6 +44,12 @@ Known Build Issues
   5. VS 2022 Build Tools + CUDA 13.0 requires --allow-unsupported-compiler
      because the host_config.h version check in CUDA 13.0 is conservative.
      This is safe: MSVC 14.44 is fully compatible in practice.
+
+  6. Nsight Compute may report ERR_NVGPUCTRPERM if NVIDIA performance counters
+     are restricted to administrator users. Fix it in NVIDIA App:
+     System > Advanced > Developer > Manage GPU Performance Counters >
+     Allow access to the GPU performance counters to all users. Alternatively,
+     run the profiling command from an Administrator shell.
 
 Build Command
   Run build_cuda.bat from the btcrecover-master directory.

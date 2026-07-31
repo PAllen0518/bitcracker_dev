@@ -69,11 +69,16 @@ Options:
 
 SAVE FORMAT
 -----------
-Binary SaveState struct (compatible with multibit_cuda.exe saves):
-  tokenlist path, wallet path, combo_idx (uint64), total_combos, passwords_checked
+Binary SaveState struct:
+  tokenlist path, wallet path, combo_idx (uint64), total_combos,
+  passwords_checked, perm_idx, typo_idx
 
-Save uses combo_idx, not a password count, so restore jumps straight to the
-right combo in O(combo_idx) C++ operations (microseconds, not hours).
+Save uses combo_idx plus the current permutation and typo indexes, so restore
+resumes at the next exact candidate even when a single token combination expands
+to millions of permutations or typo variants.
+
+Old CUDA save files that only contain combo_idx still load, but resume at combo
+precision because the older file format did not record perm_idx or typo_idx.
 
 
 TOKEN LIST FORMAT
@@ -97,7 +102,7 @@ MultiBit Classic key derivation (OpenSSL EVP_BytesToKey with MD5):
   aes_key = key1 + key2  (32 bytes, AES-256)
 
 Decrypt 32 bytes from wallet using AES-256-CBC.
-Valid password → Bitcoin WIF private key:
+Valid password -> Bitcoin WIF private key:
   byte[0] in {L, K, 5, Q}  and  all 32 bytes are valid base58 chars.
 
 Early rejection after block 1 (first 16 bytes) rejects 98.4% of wrong
@@ -111,5 +116,5 @@ KNOWN LIMITATIONS
 - Digit wildcard only (%0,4d); other wildcard types ignored
 - typos-replace and typos-map are not ported (typos-capslock/swap/repeat/
   delete/closecase/insert are)
-- A found password is written to RECOVERED_PASSWORD.txt (owner read/write),
-  not printed to the terminal
+- A found password is CPU-verified, then written to RECOVERED_PASSWORD.txt
+  (owner read/write), not printed to the terminal

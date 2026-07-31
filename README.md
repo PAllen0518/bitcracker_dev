@@ -14,7 +14,7 @@ Several tools cover different parts of the search space:
 | Tool | Language | Rate | Typos |
 |---|---|---|---|
 | `multibit_cuda_threads.exe` | CUDA C++ | ~11M/s | Yes |
-| `multibit_gpu.py` | Python 3 + OpenCL | ~500K–11M/s | No |
+| `multibit_gpu.py` | Python 3 + OpenCL | ~500K-11M/s | No |
 | `multibit_check.py` | Python 3 (CPU) | ~67K/s | Yes |
 | `btcrecover.py` | Python 2.7 (legacy) | ~54K/s | Yes |
 
@@ -51,7 +51,7 @@ salted  = password_bytes + salt        (8-byte random salt from wallet file)
 key1    = MD5(salted)
 key2    = MD5(key1 + salted)
 iv      = MD5(key2 + salted)
-aes_key = key1 + key2                  (32 bytes → AES-256-CBC)
+aes_key = key1 + key2                  (32 bytes -> AES-256-CBC)
 ```
 
 Decrypt the first 32 bytes of the wallet's encrypted section. A valid password produces a Bitcoin WIF private key: first byte in `{L, K, 5, Q}` and all 32 bytes valid base58 characters.
@@ -61,7 +61,7 @@ Decrypt the first 32 bytes of the wallet's encrypted section. A valid password p
 ## Requirements
 
 ### CUDA tool (`multibit_cuda_threads.exe`)
-- NVIDIA GPU, compute capability ≥ sm_75 (RTX 2060 or newer)
+- NVIDIA GPU, compute capability >= sm_75 (RTX 2060 or newer)
 - CUDA Toolkit 13.0
 - Visual Studio 2022 Build Tools (MSVC 14.44); note VS 2026 isn't supported by CUDA 13.0
 - Windows SDK 10.0.22621.0
@@ -160,7 +160,10 @@ Bravo bravo                # optional, any position
 
 ## Save / Restore
 
-All three tools can be interrupted and resumed. The CUDA and Python GPU tools save a `combo_idx`, so restore jumps straight to the saved position instead of replaying every previous password.
+All three tools can be interrupted and resumed. The CUDA tool saves `combo_idx`,
+`perm_idx`, and `typo_idx`, so restore resumes at the next exact candidate even
+inside a large permutation or typo-expanded combination. Old CUDA save files
+without `perm_idx`/`typo_idx` still load, but only at combo precision.
 
 Save files (`.bin`, `.pkl`, `savefile*`) are excluded from version control.
 
@@ -168,7 +171,7 @@ Save files (`.bin`, `.pkl`, `savefile*`) are excluded from version control.
 
 ## Performance Notes
 
-- The CUDA tool achieves ~11M passwords/sec for token lists with 4–9 free tokens per combination (search46 structure)
+- The CUDA tool achieves ~11M passwords/sec for token lists with 4-9 free tokens per combination (search46 structure)
 - The big win was stack char arrays in the password assembly loop instead of `std::string`, which cut out a malloc/free per password and took it from ~3M/s to ~11M/s
 - For token lists with anchored required tokens and few free tokens (e.g. search47), the CUDA tool completes 76M passwords in ~7 seconds
 - The CUDA tool generates typo variants (see `--typos` above); typo generation allocates and runs below the 11M/s base rate, so it's for focused passes over close candidates rather than full sweeps
@@ -179,18 +182,18 @@ Save files (`.bin`, `.pkl`, `savefile*`) are excluded from version control.
 
 ```
 BitCracker/btcrecover-master/
-├── multibit_cuda_threads.cu    # Primary CUDA tool (C++ gen + GPU check)
-├── multibit_cuda.cu            # Experimental: GPU-side generation (slower)
-├── multibit_gpu.py             # Python + OpenCL GPU tool
-├── multibit_gpu_2.py           # Experimental: local memory kernel variant
-├── build_cuda.bat              # CUDA build script
-├── multibit_cuda_readme.txt    # CUDA tool documentation
-├── multibit_cuda_requirements.txt
-├── multibit_check.py           # Standalone Python 3 CPU checker (MultiBit + typos)
-├── tests/                      # pytest suite (crypto KATs, typos, tokenlist)
-├── btcrecover.py               # Legacy btcrecover entry point (Python 2.7)
-└── btcrecover/
-    └── btcrpass.py             # Modified: fast restore + base58 tweak
+|-- multibit_cuda_threads.cu    # Primary CUDA tool (C++ gen + GPU check)
+|-- multibit_cuda.cu            # Experimental: GPU-side generation (slower)
+|-- multibit_gpu.py             # Python + OpenCL GPU tool
+|-- multibit_gpu_2.py           # Experimental: local memory kernel variant
+|-- build_cuda.bat              # CUDA build script
+|-- multibit_cuda_readme.txt    # CUDA tool documentation
+|-- multibit_cuda_requirements.txt
+|-- multibit_check.py           # Standalone Python 3 CPU checker (MultiBit + typos)
+|-- tests/                      # pytest suite (crypto KATs, typos, tokenlist)
+|-- btcrecover.py               # Legacy btcrecover entry point (Python 2.7)
+`-- btcrecover/
+    `-- btcrpass.py             # Modified: fast restore + base58 tweak
 ```
 
 ---
@@ -217,5 +220,5 @@ Licensed under the GNU General Public License v2.0 (see [LICENSE](LICENSE)).
 This project began as a fork of [btcrecover](https://github.com/gurnec/btcrecover)
 by Christopher Gurnee, which is GPLv2, so this derivative is GPLv2 as well. The
 CUDA kernels, the OpenCL GPU tool, the Python 3 checker, and the fast-restore work
-are new code (© 2026 Paul Allen); the vendored `btcrecover/` tree remains under its
+are new code (Copyright 2026 Paul Allen); the vendored `btcrecover/` tree remains under its
 original copyright.

@@ -25,8 +25,8 @@ import hashlib
 import itertools
 import os
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
 
 try:
     from Crypto.Cipher import AES
@@ -61,7 +61,7 @@ class MultiBitWallet:
     encrypted: bytes   # 32 bytes: the first two AES blocks
 
     @classmethod
-    def load(cls, path: str) -> "MultiBitWallet":
+    def load(cls, path: str) -> MultiBitWallet:
         with open(path, "r") as f:
             raw = f.read(70)
         joined = "".join(raw.split())
@@ -113,7 +113,7 @@ class TypoSpec:
     closecase: bool = False
     insert: str = ""                                  # charset to insert
     replace: str = ""                                 # charset to replace with
-    typos_map: Dict[str, str] = field(default_factory=dict)
+    typos_map: dict[str, str] = field(default_factory=dict)
 
     @property
     def enabled(self) -> bool:
@@ -147,7 +147,7 @@ def _at_case_boundary(pw: str, i: int) -> bool:
     return (prev not in (0, cur)) or (nxt not in (0, cur))
 
 
-def _capslock_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]:
+def _capslock_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[tuple[str, int]]:
     yield pw, used
     if spec.capslock and used < spec.max_typos:
         swapped = _swapcase(pw)
@@ -155,7 +155,7 @@ def _capslock_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, i
             yield swapped, used + 1
 
 
-def _swap_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]:
+def _swap_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[tuple[str, int]]:
     yield pw, used
     if not spec.swap:
         return
@@ -164,7 +164,7 @@ def _swap_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]
         for idxs in itertools.combinations(range(len(pw) - 1), k):
             # No two chosen indexes may be adjacent, or a single character would
             # be swapped twice in one variant.
-            if any(b - a == 1 for a, b in zip(idxs, idxs[1:])):
+            if any(b - a == 1 for a, b in itertools.pairwise(idxs)):
                 continue
             chars = list(pw)
             ok = True
@@ -177,9 +177,9 @@ def _swap_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]
                 yield "".join(chars), used + k
 
 
-def _simple_options(pw: str, i: int, spec: TypoSpec) -> List[str]:
+def _simple_options(pw: str, i: int, spec: TypoSpec) -> list[str]:
     """The replacement strings a single position can take under simple typos."""
-    opts: List[str] = []
+    opts: list[str] = []
     if spec.repeat:
         opts.append(pw[i] * 2)
     if spec.delete:
@@ -199,7 +199,7 @@ def _simple_options(pw: str, i: int, spec: TypoSpec) -> List[str]:
     return opts
 
 
-def _simple_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]:
+def _simple_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[tuple[str, int]]:
     yield pw, used
     if not (spec.repeat or spec.delete or spec.case or spec.closecase
             or spec.replace or spec.typos_map):
@@ -220,7 +220,7 @@ def _simple_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int
                 yield "".join(out), used + k
 
 
-def _insert_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[Tuple[str, int]]:
+def _insert_stage(pw: str, used: int, spec: TypoSpec) -> Iterator[tuple[str, int]]:
     yield pw, used
     if not spec.insert:
         return
@@ -272,16 +272,16 @@ def typo_variants(base: str, spec: TypoSpec) -> Iterator[str]:
 @dataclass
 class Token:
     text: str
-    anchor: Optional[int]   # None = free, >=0 = fixed 0-indexed slot, -1 = last
+    anchor: int | None   # None = free, >=0 = fixed 0-indexed slot, -1 = last
 
 
 @dataclass
 class TokenLine:
-    tokens: List[Token]
+    tokens: list[Token]
     required: bool
 
 
-def _expand_digit_wildcard(spec: str) -> List[str]:
+def _expand_digit_wildcard(spec: str) -> list[str]:
     """Expand %0,4d style specs into every concrete digit string."""
     body = spec[1:].rstrip("d")
     if "," in body:
@@ -294,7 +294,7 @@ def _expand_digit_wildcard(spec: str) -> List[str]:
     return out
 
 
-def _parse_token(tok: str) -> List[Token]:
+def _parse_token(tok: str) -> list[Token]:
     if tok.startswith("%") and tok.endswith("d"):
         return [Token(t, None) for t in _expand_digit_wildcard(tok)]
     if tok.endswith("$"):
@@ -308,8 +308,8 @@ def _parse_token(tok: str) -> List[Token]:
     return [Token(tok, None)]
 
 
-def parse_tokenlist(path: str, delimiter: Optional[str] = None) -> List[TokenLine]:
-    lines: List[TokenLine] = []
+def parse_tokenlist(path: str, delimiter: str | None = None) -> list[TokenLine]:
+    lines: list[TokenLine] = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             line = raw.rstrip("\r\n")
@@ -323,7 +323,7 @@ def parse_tokenlist(path: str, delimiter: Optional[str] = None) -> List[TokenLin
                 # delimiter is in use.
                 stripped = stripped[1:].lstrip()
             parts = stripped.split(delimiter) if delimiter else stripped.split()
-            tokens: List[Token] = []
+            tokens: list[Token] = []
             for part in parts:
                 tokens.extend(_parse_token(part))
             if tokens:
@@ -331,10 +331,10 @@ def parse_tokenlist(path: str, delimiter: Optional[str] = None) -> List[TokenLin
     return lines
 
 
-def _assemble(free: List[str], anchored: List[Tuple[int, str]]) -> Optional[str]:
+def _assemble(free: list[str], anchored: list[tuple[int, str]]) -> str | None:
     """Place anchored tokens at fixed slots and free tokens in the gaps."""
     total = len(free) + len(anchored)
-    slots: List[Optional[str]] = [None] * total
+    slots: list[str | None] = [None] * total
     for pos, text in anchored:
         slot = total - 1 if pos == -1 else pos
         if not 0 <= slot < total or slots[slot] is not None:
@@ -347,7 +347,7 @@ def _assemble(free: List[str], anchored: List[Tuple[int, str]]) -> Optional[str]
     return "".join(slots)
 
 
-def generate_passwords(lines: List[TokenLine]) -> Iterator[str]:
+def generate_passwords(lines: list[TokenLine]) -> Iterator[str]:
     """Yield every base password the tokenlist describes (before typos)."""
     # Each line contributes one choice; optional lines add a "skip" choice.
     per_line_choices = [
@@ -403,8 +403,8 @@ def build_typospec(args: argparse.Namespace) -> TypoSpec:
     )
 
 
-def search(wallet: MultiBitWallet, lines: List[TokenLine],
-           spec: TypoSpec) -> Optional[str]:
+def search(wallet: MultiBitWallet, lines: list[TokenLine],
+           spec: TypoSpec) -> str | None:
     checked = 0
     for base in generate_passwords(lines):
         for candidate in typo_variants(base, spec):
@@ -417,7 +417,7 @@ def search(wallet: MultiBitWallet, lines: List[TokenLine],
     return None
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="MultiBit Classic password checker (Python 3).")
     p.add_argument("--wallet", required=True, help="MultiBit Classic .key file")
     p.add_argument("--tokenlist", required=True, help="btcrecover-style token list")

@@ -5,8 +5,9 @@ password is known. If the MD5/AES/base58 derivation ever regresses, the correct
 password stops validating (or a wrong one starts) and these fail.
 """
 
-import multibit_check
 from conftest import TEST_WALLET
+
+import multibit_check
 
 
 def test_wallet_loads():

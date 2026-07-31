@@ -1,8 +1,8 @@
 """Tests for tokenlist parsing, base-password generation, and end-to-end search."""
 
-from multibit_check import (MultiBitWallet, TypoSpec, generate_passwords,
-                            parse_tokenlist, search)
 from conftest import TEST_WALLET, TEST_WALLET_PASSWORD
+
+from multibit_check import MultiBitWallet, TypoSpec, generate_passwords, parse_tokenlist, search
 
 
 def write_tokenlist(tmp_path, text):
