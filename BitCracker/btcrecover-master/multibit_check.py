@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Standalone MultiBit Classic wallet password checker.
 
 A self-contained Python 3 CPU checker for MultiBit Classic `.key` backups. It
