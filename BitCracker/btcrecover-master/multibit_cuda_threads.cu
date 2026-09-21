@@ -285,6 +285,8 @@ __global__ void check_kernel(
         atomicCAS(found_idx, -1, gid);
 }
 
+#include "cuda_crypto.cuh"
+
 // ---------------------------------------------------------------------------
 // Host: AES/MD5 table setup
 // ---------------------------------------------------------------------------
@@ -577,28 +579,7 @@ static std::vector<TokenLine> parse_tokenlist(const char* path, char delimiter) 
 // The producer thread fills one buffer while the GPU checks the other.
 // ---------------------------------------------------------------------------
 
-struct Batch {
-    std::vector<uint8_t>  pw_data;  // flat: n * PW_STRIDE bytes
-    std::vector<uint32_t> pw_lens;
-    int      count;
-    uint64_t next_combo_idx;        // exact resume point after this batch
-    uint64_t next_perm_idx;
-    uint64_t next_typo_idx;
-    uint64_t passwords_total;       // cumulative passwords checked before this batch
-
-    Batch() : count(0),
-              next_combo_idx(0), next_perm_idx(0), next_typo_idx(0),
-              passwords_total(0) {
-        // These stay as normal vectors. Pinned cudaHostAlloc looked tempting,
-        // but allocating a fresh pinned batch every 1M candidates cost more
-        // than it saved on the long search runs this tool is built for.
-        pw_data.resize(BATCH_SIZE * PW_STRIDE);
-        pw_lens.resize(BATCH_SIZE);
-    }
-    Batch(const Batch&) = delete;
-    Batch& operator=(const Batch&) = delete;
-    bool full() const { return count>=BATCH_SIZE; }
-};
+#include "cuda_buffers.hpp"
 
 static uint64_t factorial_u64(int n) {
     uint64_t out = 1;
@@ -622,7 +603,7 @@ struct AnchorSlot {
 
 // Writes the assembled password into 'out' (char[PW_MAX_LEN]), sets *out_len.
 // All token pointers are stable (point into TokenLine.tokens strings).
-static inline void assemble_password_fast(
+[[maybe_unused]] static inline void assemble_password_fast(
     const char** free_ptrs, const int* free_lens, int n_free,
     const AnchorSlot* anchors, int n_anchored,
     const int* perm,   // permutation of [0..n_free-1]
@@ -891,7 +872,7 @@ static void typo_stage_insert(const std::vector<TypoCandidate>& in, const TypoCo
 // Top-level: applies all enabled typo stages, in btcrecover's fixed order,
 // to a single base password, sharing the --typos N budget across all of
 // them. Returns every variant, including the unmodified original (0 typos).
-static std::vector<TypoCandidate> generate_typo_variants(const std::string& base_pw,
+[[maybe_unused]] static std::vector<TypoCandidate> generate_typo_variants(const std::string& base_pw,
                                                            const TypoConfig& cfg) {
     std::vector<TypoCandidate> stage{ {base_pw, 0} };
     if (cfg.capslock) {
@@ -921,197 +902,9 @@ static std::vector<TypoCandidate> generate_typo_variants(const std::string& base
 // Producer thread: generates passwords and fills batch buffers
 // ---------------------------------------------------------------------------
 
-struct ProducerState {
-    const std::vector<TokenLine>* lines;
-    uint64_t start_combo;
-    uint64_t start_perm;
-    uint64_t start_typo;
-    uint64_t total_combos;
-    const TypoConfig*       typo_cfg = nullptr;  // nullptr or !any() => no typo generation
-
-    std::mutex              mtx;
-    std::condition_variable cv_ready;    // signals main thread: batch is ready
-    std::condition_variable cv_consumed; // signals producer: batch was consumed
-    std::unique_ptr<Batch>  ready_batch; // owned; transferred via std::move
-    bool                    done;
-
-    ProducerState() : start_combo(0), start_perm(0), start_typo(0),
-                      ready_batch(nullptr), done(false) {}
-};
-
-static void producer_thread(ProducerState* state, uint64_t pw_count_base) {
-    const auto& lines = *state->lines;
-    int n_lines = (int)lines.size();
-
-    // Compute line sizes (number of options including None for optional)
-    std::vector<int> line_sizes(n_lines);
-    for (int i=0;i<n_lines;i++)
-        line_sizes[i] = (int)lines[i].tokens.size() + (lines[i].required ? 0 : 1);
-
-    // Initialise combo to start_combo using mixed-radix decode
-    std::vector<int> combo(n_lines,0);
-    {
-        uint64_t idx=state->start_combo;
-        for (int i=0;i<n_lines;i++) { combo[i]=(int)(idx%line_sizes[i]); idx/=line_sizes[i]; }
-    }
-
-    // Batches are moved across the producer/GPU boundary. The next_* fields on
-    // each batch record the first candidate not included in that batch, so an
-    // autosave after the batch can resume without skipping the rest of a large
-    // permutation set.
-    auto cur = std::make_unique<Batch>();
-    cur->passwords_total = pw_count_base;
-    uint64_t combo_idx = state->start_combo;
-
-    auto push_batch = [&]() {
-        if (cur->count == 0) return;
-        std::unique_lock<std::mutex> lk(state->mtx);
-        state->cv_consumed.wait(lk,[&]{ return state->ready_batch==nullptr||state->done; });
-        if (state->done) return;
-        uint64_t next_base = cur->passwords_total + cur->count;
-        state->ready_batch = std::move(cur);   // transfer ownership to main thread
-        state->cv_ready.notify_one();
-        cur = std::make_unique<Batch>();
-        cur->passwords_total = next_base;
-    };
-
-    // Hot-path buffers, reused across every combo and permutation.
-    const char* free_ptrs[MAX_FREE];
-    int         free_lens[MAX_FREE];
-    AnchorSlot  anchors[MAX_ANCHORED];
-    int         perm[MAX_FREE];
-    char        pw_buf[PW_MAX_LEN];
-    int         pw_len;
-
-    auto add_password = [&](uint64_t next_combo, uint64_t next_perm, uint64_t next_typo) {
-        if (pw_len == 0 || pw_len > PW_MAX_LEN) return;
-        int slot = cur->count;
-        uint8_t* dst = cur->pw_data.data() + slot * PW_STRIDE;
-        memcpy(dst, pw_buf, pw_len);
-        cur->pw_lens[slot] = (uint32_t)pw_len;
-        cur->next_combo_idx = next_combo;
-        cur->next_perm_idx = next_perm;
-        cur->next_typo_idx = next_typo;
-        cur->count++;
-        if (cur->full()) push_batch();
-    };
-
-    // Sibling of add_password() for typo variants, which are std::strings
-    // (heap-allocated during generation) rather than the stack pw_buf.
-    auto add_password_str = [&](const std::string& s, uint64_t next_combo,
-                                uint64_t next_perm, uint64_t next_typo) {
-        if (s.empty() || (int)s.size() > PW_MAX_LEN) return;
-        int slot = cur->count;
-        uint8_t* dst = cur->pw_data.data() + slot * PW_STRIDE;
-        memcpy(dst, s.data(), s.size());
-        cur->pw_lens[slot] = (uint32_t)s.size();
-        cur->next_combo_idx = next_combo;
-        cur->next_perm_idx = next_perm;
-        cur->next_typo_idx = next_typo;
-        cur->count++;
-        if (cur->full()) push_batch();
-    };
-
-    // Iterate all combos from start_combo to total_combos.
-    for (; combo_idx < state->total_combos; combo_idx++) {
-
-        // Decode this combo into free and anchored tokens. Pointers reference
-        // the token strings directly, nothing is copied here.
-        int n_free = 0, n_anchored = 0;
-        bool valid = true;
-
-        for (int i=0;i<n_lines;i++) {
-            int ch = combo[i];
-            if (!lines[i].required) {
-                if (ch == 0) continue;  // None: skip this line
-                ch--;                   // 0=None, 1..n = tokens[0..n-1]
-            }
-            if (ch < 0 || ch >= (int)lines[i].tokens.size()) { valid=false; break; }
-            const std::string& tok = lines[i].tokens[ch];
-            if (lines[i].has_anchor) {
-                if (n_anchored >= MAX_ANCHORED) {
-                    fprintf(stderr,"\nFATAL: token combination has more than %d anchored tokens.\n", MAX_ANCHORED);
-                    exit(1);
-                }
-                anchors[n_anchored++] = { lines[i].anchor_pos,
-                                          tok.c_str(), (int)tok.size() };
-            } else {
-                if (n_free >= MAX_FREE) {
-                    fprintf(stderr,"\nFATAL: token combination has more than %d free tokens.\n", MAX_FREE);
-                    exit(1);
-                }
-                free_ptrs[n_free] = tok.c_str();
-                free_lens[n_free] = (int)tok.size();
-                n_free++;
-            }
-        }
-
-        if (valid && n_free > 0) {
-            // Walk all n_free! orderings, resuming inside the permutation list
-            // when a save file recorded perm_idx.
-            for (int i=0;i<n_free;i++) perm[i]=i;
-            uint64_t perm_total = factorial_u64(n_free);
-            uint64_t perm_idx = (combo_idx == state->start_combo) ? state->start_perm : 0;
-            if (perm_idx >= perm_total) continue;
-            for (uint64_t skipped=0; skipped<perm_idx; skipped++)
-                std::next_permutation(perm, perm + n_free);
-            do {
-                assemble_password_fast(free_ptrs, free_lens, n_free,
-                                       anchors, n_anchored, perm,
-                                       pw_buf, &pw_len);
-                if (state->typo_cfg && state->typo_cfg->any()) {
-                    auto variants = generate_typo_variants(std::string(pw_buf, pw_len), *state->typo_cfg);
-                    // Typo-expanded searches can produce many variants per base
-                    // password; typo_idx makes restore exact inside that list too.
-                    uint64_t typo_start = (combo_idx == state->start_combo && perm_idx == state->start_perm)
-                                              ? state->start_typo : 0;
-                    for (uint64_t typo_idx=typo_start; typo_idx<variants.size(); typo_idx++) {
-                        uint64_t next_combo = combo_idx;
-                        uint64_t next_perm = perm_idx;
-                        uint64_t next_typo = typo_idx + 1;
-                        if (next_typo >= variants.size()) {
-                            next_typo = 0;
-                            next_perm++;
-                            if (next_perm >= perm_total) {
-                                next_perm = 0;
-                                next_combo++;
-                            }
-                        }
-                        add_password_str(variants[(size_t)typo_idx].pw, next_combo, next_perm, next_typo);
-                    }
-                } else {
-                    uint64_t next_combo = combo_idx;
-                    uint64_t next_perm = perm_idx + 1;
-                    if (next_perm >= perm_total) {
-                        next_perm = 0;
-                        next_combo++;
-                    }
-                    add_password(next_combo, next_perm, 0);
-                }
-                perm_idx++;
-            } while (std::next_permutation(perm, perm + n_free));
-        }
-
-        // Advance combo (mixed-radix increment)
-        for (int i=0;i<n_lines;i++) {
-            combo[i]++;
-            if (combo[i] < line_sizes[i]) break;
-            combo[i] = 0;
-        }
-    }
-
-    // Push any remaining partial batch
-    if (cur->count > 0) push_batch();
-
-    // Signal done
-    {
-        std::unique_lock<std::mutex> lk(state->mtx);
-        state->done = true;
-        state->cv_ready.notify_all();
-    }
-    // cur is a unique_ptr, freed automatically here
-}
-
+#include "cuda_typos.hpp"
+#include "cuda_generation.hpp"
+#define MULTIBIT_OPTIMIZED 1
 
 // ---------------------------------------------------------------------------
 // Save / restore
@@ -1192,60 +985,52 @@ static const char* fmt_eta(double secs, char* buf) {
 // GPU engine (GPU buffers + kernel launch)
 // ---------------------------------------------------------------------------
 
-struct GPUEngine {
-    uint8_t*  d_pw;
-    uint32_t* d_lens;
-    int*      d_found;
-    int       h_found;
-    cudaStream_t stream;
-
-    GPUEngine() {
-        CUDA_CHECK(cudaMalloc(&d_pw,    (size_t)BATCH_SIZE * PW_STRIDE));
-        CUDA_CHECK(cudaMalloc(&d_lens,  (size_t)BATCH_SIZE * 4));
-        CUDA_CHECK(cudaMalloc(&d_found, 4));
-        CUDA_CHECK(cudaStreamCreate(&stream));
-        h_found = -1;
-    }
-    ~GPUEngine() {
-        cudaStreamDestroy(stream);
-        cudaFree(d_pw);
-        cudaFree(d_lens);
-        cudaFree(d_found);
-    }
-
-    // Returns found password index (into the batch) or -1. The stream scopes
-    // synchronization to this launch while preserving normal pageable-memory
-    // copies, which are faster here than per-batch pinned allocations.
-    int check(const Batch& b) {
-        h_found = -1;
-        CUDA_CHECK(cudaMemcpy(d_pw,    b.pw_data.data(), (size_t)b.count * PW_STRIDE,
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lens,  b.pw_lens.data(), (size_t)b.count * sizeof(uint32_t),
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_found, &h_found, sizeof(int), cudaMemcpyHostToDevice));
-        int threads = 256;
-        int blocks  = (b.count + threads - 1) / threads;
-        check_kernel<<<blocks, threads, 0, stream>>>(d_pw, d_lens, b.count, PW_STRIDE, d_found);
-        CUDA_CHECK(cudaGetLastError());        // catch async launch errors
-        CUDA_CHECK(cudaStreamSynchronize(stream));   // wait and catch execution errors
-        CUDA_CHECK(cudaMemcpy(&h_found, d_found, sizeof(int), cudaMemcpyDeviceToHost));
-        return h_found;
-    }
-};
+#include "cuda_pipeline.hpp"
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-int main(int argc, char** argv) {
+static int run_application(int argc, char** argv) {
     const char* wallet_path    = nullptr;
     const char* tokenlist_path = nullptr;
     const char* autosave_path  = nullptr;
     const char* restore_path   = nullptr;
     char        delimiter      = ' ';
     TypoConfig  typo_cfg;
+    int batch_size = BATCH_SIZE;
+    int producers = 1;
+    bool synchronous = false, timings = false;
+    unsigned int hw_threads = std::thread::hardware_concurrency();
+    int max_producers = hw_threads > 0 ? static_cast<int>(hw_threads) : 1;
 
     for (int i=1;i<argc;i++) {
+        if (!strcmp(argv[i], "--batch-size")) {
+            if (++i >= argc) throw std::invalid_argument("missing batch size");
+            std::string value(argv[i]);
+            size_t consumed = 0;
+            unsigned long parsed = std::stoul(value, &consumed);
+            if (consumed != value.size() || parsed < 1 || parsed > BATCH_SIZE) {
+                throw std::invalid_argument("batch size must be from 1 to 1048576");
+            }
+            batch_size = static_cast<int>(parsed);
+            continue;
+        }
+        if (!strcmp(argv[i], "--producers")) {
+            if (++i >= argc) throw std::invalid_argument("missing producer count");
+            std::string value(argv[i]);
+            size_t consumed = 0;
+            unsigned long parsed = std::stoul(value, &consumed);
+            if (consumed != value.size() || parsed < 1
+                || parsed > static_cast<unsigned long>(max_producers)) {
+                throw std::invalid_argument(
+                    "producers must be from 1 to the logical-core count");
+            }
+            producers = static_cast<int>(parsed);
+            continue;
+        }
+        if (!strcmp(argv[i], "--synchronous")) { synchronous = true; continue; }
+        if (!strcmp(argv[i], "--timings")) { timings = true; continue; }
         if      (!strcmp(argv[i],"--wallet")           && i+1<argc) wallet_path           = argv[++i];
         else if (!strcmp(argv[i],"--tokenlist")        && i+1<argc) tokenlist_path        = argv[++i];
         else if (!strcmp(argv[i],"--autosave")         && i+1<argc) autosave_path         = argv[++i];
@@ -1281,10 +1066,12 @@ int main(int argc, char** argv) {
     }
     if (!wallet_path || !tokenlist_path) {
         fprintf(stderr,"Usage: multibit_cuda_threads.exe --wallet <f> --tokenlist <f> [--autosave <f>]\n"
-                       "                                  [--delimiter <c>] [--typos N [--typos-capslock]\n"
-                       "                                  [--typos-swap] [--typos-repeat] [--typos-delete]\n"
-                       "                                  [--typos-closecase] [--typos-insert <charset>]]\n"
-                       "       multibit_cuda_threads.exe --restore <save.bin>\n");
+                       "                                  [--delimiter <c>] [--producers N] [--typos N\n"
+                       "                                  [--typos-capslock] [--typos-swap] [--typos-repeat]\n"
+                       "                                  [--typos-delete] [--typos-closecase]\n"
+                       "                                  [--typos-insert <charset>]]\n"
+                       "       multibit_cuda_threads.exe --restore <save.bin>\n"
+                       "  --producers N  parallel candidate-generation threads (default 1)\n");
         return 1;
     }
 
@@ -1325,118 +1112,114 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Start producer thread
-    ProducerState ps;
-    ps.lines        = &lines;
-    ps.start_combo  = state.combo_idx;
-    ps.start_perm   = state.perm_idx;
-    ps.start_typo   = state.typo_idx;
-    ps.total_combos = total_combos;
-    ps.typo_cfg     = &typo_cfg;
-    if (typo_cfg.any() && typo_cfg.max_typos > 0)
-        printf("Typos enabled: budget %d (capslock=%d swap=%d repeat=%d delete=%d closecase=%d insert=%d)\n",
-               typo_cfg.max_typos, typo_cfg.capslock, typo_cfg.swap, typo_cfg.repeat,
-               typo_cfg.del, typo_cfg.closecase, typo_cfg.insert);
-
-    GPUEngine gpu;
-    std::thread producer(producer_thread, &ps, state.passwords_checked);
-
-    hrtimepoint start_time    = hrclock::now();
-    hrtimepoint last_save_tp  = start_time;
-    uint64_t pw_checked       = state.passwords_checked;
-    uint64_t pw_session_base  = state.passwords_checked;   // historical total at session start
-    uint64_t start_combo_idx  = state.combo_idx;
-
-    printf("Starting at combo #%llu, perm #%llu, typo #%llu  (batch size %d)\n",
-           (unsigned long long)state.combo_idx,
-           (unsigned long long)state.perm_idx,
-           (unsigned long long)state.typo_idx,
-           BATCH_SIZE);
-
+    ProducerState producer_state(batch_size, !synchronous);
+    producer_state.lines = &lines;
+    producer_state.start_combo = state.combo_idx;
+    producer_state.start_perm = state.perm_idx;
+    producer_state.start_typo = state.typo_idx;
+    producer_state.total_combos = total_combos;
+    producer_state.typo_cfg = &typo_cfg;
+    producer_state.producers = producers;
+    GPUEngine gpu(batch_size, !synchronous && producer_state.all_pinned());
+    ProducerWorker producer(producer_state, state.passwords_checked);
+    const auto start_time = hrclock::now();
+    auto last_save = start_time;
+    auto last_report = start_time;
+    const uint64_t session_base = state.passwords_checked;
+    const uint64_t combo_base = state.combo_idx;
+    double copy_ms = 0, kernel_ms = 0;
+    uint64_t transferred = 0;
+    bool found_password = false;
+    printf("Starting at combo #%llu, perm #%llu, typo #%llu "
+           "(batch size %d, producers %d)\n",
+           static_cast<unsigned long long>(state.combo_idx),
+           static_cast<unsigned long long>(state.perm_idx),
+           static_cast<unsigned long long>(state.typo_idx),
+           batch_size, producers);
     while (true) {
-        std::unique_ptr<Batch> batch;
-        {
-            std::unique_lock<std::mutex> lk(ps.mtx);
-            ps.cv_ready.wait(lk, [&]{ return ps.ready_batch != nullptr || ps.done; });
-            if (ps.ready_batch) {
-                batch = std::move(ps.ready_batch);  // take ownership; no delete needed
-                ps.cv_consumed.notify_one();
-            } else {
-                break; // done and no pending batch
-            }
+        while (gpu.can_submit()) {
+            auto batch = producer_state.take_ready(gpu.pending() == 0);
+            if (!batch) break;
+            gpu.submit(std::move(batch));
         }
-
-        int found = gpu.check(*batch);
-        pw_checked = batch->passwords_total + batch->count;
-
+        if (!gpu.pending()) break;
+        auto batch = gpu.complete();
+        const int found = batch->found_index;
+        if (found < -1 || found >= batch->count) {
+            throw std::runtime_error("GPU returned an invalid candidate index");
+        }
+        const uint8_t* password = found >= 0
+            ? batch->pw_data.data() + static_cast<size_t>(found) * batch->stride
+            : nullptr;
+        const int length = found >= 0 ? batch->pw_lens[found] : 0;
+        if (found >= 0 && !host_check_multibit(password, length, h_salt, h_enc)) {
+            throw std::runtime_error("GPU result failed independent CPU verification");
+        }
+        state.combo_idx = batch->next_combo_idx;
+        state.perm_idx = batch->next_perm_idx;
+        state.typo_idx = batch->next_typo_idx;
+        state.passwords_checked = batch->passwords_total + batch->count;
+        copy_ms += batch->copy_ms;
+        kernel_ms += batch->kernel_ms;
+        transferred += static_cast<uint64_t>(batch->count) * (batch->stride + 4);
         if (found >= 0) {
-            // Password found: read directly from the batch buffer.
-            // The buffer contains the exact bytes the producer assembled,
-            // so no index-to-string reconstruction is needed.
-            const uint8_t* pw = batch->pw_data.data() + found * PW_STRIDE;
-            int len = batch->pw_lens[found];
-            if (!host_check_multibit(pw, len, h_salt, h_enc)) {
-                fprintf(stderr,"\nWARNING: GPU reported a candidate that failed CPU verification; continuing.\n");
-                state.combo_idx         = batch->next_combo_idx;
-                state.perm_idx          = batch->next_perm_idx;
-                state.typo_idx          = batch->next_typo_idx;
-                state.passwords_checked = pw_checked;
-                continue;
-            }
-            write_found_password(pw, len);
-            if (autosave_path) {
-                state.combo_idx = batch->next_combo_idx;
-                state.perm_idx = batch->next_perm_idx;
-                state.typo_idx = batch->next_typo_idx;
-                state.passwords_checked = pw_checked;
-                save_progress(autosave_path, state);
-            }
-            ps.done = true;
-            ps.cv_consumed.notify_all();
-            break;  // batch freed automatically by unique_ptr destructor
+            write_found_password(password, length);
+            found_password = true;
+            producer_state.request_stop();
+            break;
         }
-
-        state.combo_idx         = batch->next_combo_idx;
-        state.perm_idx          = batch->next_perm_idx;
-        state.typo_idx          = batch->next_typo_idx;
-        state.passwords_checked = pw_checked;
-        // batch freed automatically here by unique_ptr destructor
-
-        // Progress: rate and ETA based on THIS SESSION only so a restored
-        // run shows true current throughput, not inflated by historical totals.
-        double elapsed        = secs_since(start_time);   // high-res, sub-second
-        uint64_t session_pw   = pw_checked - pw_session_base;
-        double rate           = elapsed > 1.0 ? (double)session_pw / elapsed : 0.0;
-        uint64_t session_cb   = state.combo_idx - start_combo_idx;
-        double combo_rate     = (elapsed > 1.0 && session_cb > 0)
-                                    ? (double)session_cb / elapsed : 0.0;
-        double remaining_cb   = (double)(total_combos - state.combo_idx);
-        double eta_secs       = combo_rate > 0 ? remaining_cb / combo_rate : 0.0;
-        double frac           = total_combos > 0
-                                    ? (double)state.combo_idx / total_combos : 0.0;
-        char pw_buf[32], rate_buf[32], eta_buf[32];
-        printf("\r%16s passwords  %9s/s  %.1f%%  ETA %s",
-               fmt_count((double)pw_checked, pw_buf),
-               fmt_count(rate, rate_buf),
-               frac * 100.0,
-               fmt_eta(eta_secs, eta_buf));
-        fflush(stdout);
-
-        if (autosave_path && secs_since(last_save_tp) >= 30.0) {
+        producer_state.recycle(std::move(batch));
+        if (secs_since(last_report) >= 0.25) {
+            const double elapsed = secs_since(start_time);
+            const double rate = (state.passwords_checked - session_base) / elapsed;
+            const double combo_rate = (state.combo_idx - combo_base) / elapsed;
+            const double remaining = static_cast<double>(total_combos - state.combo_idx);
+            const double eta = combo_rate > 0 ? remaining / combo_rate : 0;
+            const double percent = total_combos > 0
+                ? 100.0 * state.combo_idx / total_combos : 100.0;
+            char count_text[32], rate_text[32], eta_text[32];
+            printf("\r%16s passwords  %9s/s  %.1f%%  ETA %s",
+                   fmt_count(static_cast<double>(state.passwords_checked), count_text),
+                   fmt_count(rate, rate_text), percent, fmt_eta(eta, eta_text));
+            fflush(stdout);
+            last_report = hrclock::now();
+        }
+        if (autosave_path && secs_since(last_save) >= 30.0) {
             save_progress(autosave_path, state);
-            last_save_tp = hrclock::now();
+            last_save = hrclock::now();
         }
     }
-
     producer.join();
-
-    if (state.combo_idx >= total_combos) {
-        double elapsed = secs_since(start_time);
-        char pw_buf[32], rate_buf[32];
-        printf("\nSearch complete. %s passwords in %.0fs (%s/s). Not found.\n",
-               fmt_count((double)pw_checked, pw_buf),
-               elapsed,
-               fmt_count(elapsed > 0 ? (double)pw_checked / elapsed : 0, rate_buf));
+    producer_state.rethrow_failure();
+    if (!found_password) {
+        state.combo_idx = total_combos;
+        state.perm_idx = state.typo_idx = 0;
+    }
+    if (autosave_path) save_progress(autosave_path, state);
+    const double elapsed = secs_since(start_time);
+    const uint64_t checked = state.passwords_checked - session_base;
+    if (!found_password) {
+        char count_text[32], rate_text[32];
+        printf("\nSearch complete. %s passwords in %.3fs (%s/s). Not found.\n",
+               fmt_count(static_cast<double>(checked), count_text), elapsed,
+               fmt_count(elapsed > 0 ? checked / elapsed : 0, rate_text));
+    }
+    if (timings) {
+        printf("TIMINGS {\"count\":%llu,\"generation_s\":%.9f,"
+               "\"copy_ms\":%.6f,\"kernel_ms\":%.6f,\"wall_s\":%.9f,"
+               "\"transfer_bytes\":%llu,\"gpu_slots\":%d}\n",
+               static_cast<unsigned long long>(checked),
+               producer_state.generation_seconds, copy_ms, kernel_ms, elapsed,
+               static_cast<unsigned long long>(transferred), gpu.device_allocations());
     }
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run_application(argc, argv);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "FATAL: %s\n", error.what());
+        return 2;
+    }
 }
