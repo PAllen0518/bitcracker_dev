@@ -273,6 +273,20 @@ static void cancel_contract() {
     state.request_stop();
 }
 
+static void parallel_cancel_contract() {
+    std::vector<TokenLine> lines(8, {{"a", "b"}, true, false, 0});
+    ProducerState state(2, false);
+    state.lines = &lines;
+    state.total_combos = combo_count(lines);
+    state.producers = 4;
+    ProducerGuard guard(state);
+    auto held = state.take_ready(true);
+    require(held != nullptr, "parallel producer produced no batch");
+    // Hold the consumer so later units fill the merge queue and block.
+    std::this_thread::sleep_for(std::chrono::seconds(8));
+    state.request_stop();
+}
+
 static void legacy_contract() {
     SaveState original{};
     original.combo_idx = 123;
@@ -374,6 +388,7 @@ static int run_host_contract(const std::string& name) {
     else if (name == "mixed_lengths") mixed_contract();
     else if (name == "bounded_typos") bounded_contract();
     else if (name == "cancel") cancel_contract();
+    else if (name == "parallel_cancel") parallel_cancel_contract();
     else if (name == "legacy") legacy_contract();
     else if (name == "md5") md5_contract();
     else if (name == "pipeline") pipeline_contract(false);

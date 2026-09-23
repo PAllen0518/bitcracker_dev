@@ -189,6 +189,19 @@ def test_native_contract(name):
     assert invoke("contract", name).stdout.strip() == "PASS"
 
 
+def test_parallel_cancellation_wakes_blocked_workers():
+    """Stopping a backed-up parallel generator must join every worker."""
+    result = subprocess.run(
+        [str(HARNESS), "contract", "parallel_cancel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=18,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "PASS"
+
+
 def test_rejects_overlength_candidate(tmp_path):
     fixture = encrypt_fixture(b"correct")
     path = tmp_path / "bad-crypto.txt"

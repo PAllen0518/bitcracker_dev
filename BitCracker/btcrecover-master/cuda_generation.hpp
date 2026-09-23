@@ -423,6 +423,7 @@ static void generate_parallel(ProducerState& state, uint64_t base_count) {
                 }
                 sink.finish();
             }
+            if (state.stopped()) merge.abort();
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -433,8 +434,19 @@ static void generate_parallel(ProducerState& state, uint64_t base_count) {
         }
     };
     std::vector<std::thread> workers;
-    for (int i = 0; i < state.producers; ++i) workers.emplace_back(worker);
-    merge.run();
+    try {
+        for (int i = 0; i < state.producers; ++i) {
+            workers.emplace_back(worker);
+        }
+        merge.run();
+    } catch (...) {
+        state.request_stop();
+        merge.abort();
+        for (auto& thread : workers) thread.join();
+        throw;
+    }
+    // Cancellation can leave workers waiting for space in the merge queue.
+    merge.abort();
     for (auto& thread : workers) thread.join();
     if (worker_error) std::rethrow_exception(worker_error);
     merge.finish();
