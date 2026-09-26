@@ -1,5 +1,6 @@
 """Exercise recovery and persisted state through the real executable."""
 
+import hashlib
 import json
 import os
 import struct
@@ -15,6 +16,24 @@ pytestmark = pytest.mark.skipif(
     not APP.exists(),
     reason="Build the isolated optimized executable first",
 )
+
+# v1 save layout (see save_format.hpp / CHECKPOINT_INTEGRITY_SPEC.md). The
+# progress counters sit after the magic/version, identity hashes, and the two
+# 512-byte path fields; a SHA-256 over the record body trails them.
+V1_MAGIC = b"MBCKSV1\x00"
+V1_COMBO_OFF = 1144        # combo_idx, then total_combos, passwords_checked
+V1_PERM_OFF = 1168         # perm_idx, then typo_idx
+V1_CHECKSUM_OFF = 1184     # SHA-256 over bytes [0, V1_CHECKSUM_OFF)
+V1_SIZE = 1216
+
+
+def reseal_v1(data):
+    """Recompute the record checksum after editing v1 progress fields, so the
+    result is a valid save the tool will accept (the integrity check is real)."""
+    data[V1_CHECKSUM_OFF:V1_SIZE] = hashlib.sha256(
+        bytes(data[:V1_CHECKSUM_OFF])
+    ).digest()
+    return data
 
 
 def run_app(directory, tokens, *options):
@@ -125,8 +144,9 @@ def test_cli_complete_and_resume_have_exact_counts(tmp_path):
     assert timing_values(result.stdout)["count"] == 4
     assert "Not found" in result.stdout
     data = checkpoint.read_bytes()
-    # Existing layout: two 512-byte paths, three counters, two offsets.
-    combo, total, checked = struct.unpack_from("<QQQ", data, 1024)
+    assert data[:8] == V1_MAGIC
+    assert len(data) == V1_SIZE
+    combo, total, checked = struct.unpack_from("<QQQ", data, V1_COMBO_OFF)
     assert combo == total == 2
     assert checked == 4
     resumed = subprocess.run(
@@ -170,10 +190,12 @@ def test_cli_mid_typo_resume_preserves_remaining_count(tmp_path):
     assert result.returncode == 0, result.stderr
     assert timing_values(result.stdout)["count"] == 5
     data = bytearray(checkpoint.read_bytes())
-    struct.pack_into("<Q", data, 1024, 0)
-    struct.pack_into("<Q", data, 1040, 2)
-    struct.pack_into("<QQ", data, 1048, 0, 2)
-    checkpoint.write_bytes(data)
+    assert data[:8] == V1_MAGIC
+    struct.pack_into("<Q", data, V1_COMBO_OFF, 0)      # combo_idx
+    struct.pack_into("<Q", data, V1_COMBO_OFF + 16, 2)  # passwords_checked
+    struct.pack_into("<QQ", data, V1_PERM_OFF, 0, 2)    # perm_idx, typo_idx
+    reseal_v1(data)  # re-sign the edited record so restore accepts it
+    checkpoint.write_bytes(bytes(data))
     result = subprocess.run(
         [str(APP), "--restore", str(checkpoint), *options],
         cwd=tmp_path,
@@ -184,3 +206,87 @@ def test_cli_mid_typo_resume_preserves_remaining_count(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert timing_values(result.stdout)["count"] == 3
+
+
+def _restore(tmp_path, checkpoint, *options, stdin=None):
+    return subprocess.run(
+        [str(APP), "--restore", str(checkpoint), *options],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        input=stdin,
+    )
+
+
+def _autosaved_search(tmp_path):
+    """Run a short no-recovery search and return its v1 checkpoint path."""
+    checkpoint = tmp_path / "synthetic.bin"
+    result = run_app(
+        tmp_path, "+ab cd\n+ef\n",
+        "--batch-size", "3", "--autosave", str(checkpoint),
+    )
+    assert result.returncode == 0, result.stderr
+    assert checkpoint.read_bytes()[:8] == V1_MAGIC
+    return checkpoint
+
+
+def test_cli_restore_refuses_edited_tokenlist_same_count(tmp_path):
+    # The core fix: a different token list with the SAME combo count must not
+    # silently resume against the wrong search space.
+    checkpoint = _autosaved_search(tmp_path)
+    (tmp_path / "synthetic.txt").write_text("+gh ij\n+kl\n", encoding="utf-8")
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3")
+    assert result.returncode != 0
+    assert "token-list" in result.stderr.lower()
+    assert not (tmp_path / "RECOVERED_PASSWORD.txt").exists()
+
+
+def test_cli_restore_refuses_changed_delimiter(tmp_path):
+    checkpoint = _autosaved_search(tmp_path)
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3",
+                      "--delimiter", ",")
+    assert result.returncode != 0
+    assert "delimiter" in result.stderr.lower()
+
+
+def test_cli_restore_refuses_corrupted_save(tmp_path):
+    checkpoint = _autosaved_search(tmp_path)
+    data = bytearray(checkpoint.read_bytes())
+    data[V1_COMBO_OFF] ^= 0x01  # flip a bit without re-sealing the checksum
+    checkpoint.write_bytes(bytes(data))
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3")
+    assert result.returncode != 0
+    assert "corrupt" in result.stderr.lower()
+
+
+def _make_legacy_save(path, token_path, wallet_path, combo, total, checked):
+    """Write a 1064-byte legacy (v0) checkpoint, the format Search60 uses."""
+    data = bytearray(1064)
+    data[: len(str(token_path))] = str(token_path).encode()
+    wallet_bytes = str(wallet_path).encode()
+    data[512 : 512 + len(wallet_bytes)] = wallet_bytes
+    struct.pack_into("<QQQQQ", data, 1024, combo, total, checked, 0, 0)
+    path.write_bytes(bytes(data))
+
+
+def test_cli_legacy_requires_confirmation_then_migrates(tmp_path):
+    token_file = tmp_path / "synthetic.txt"
+    token_file.write_text("+ab cd\n+ef\n", encoding="utf-8")  # 2 combos
+    checkpoint = tmp_path / "legacy.bin"
+    _make_legacy_save(checkpoint, token_file, WALLET, 0, 2, 0)
+    original = checkpoint.read_bytes()
+
+    # Without the exact confirmation token the legacy save is refused untouched.
+    refused = _restore(tmp_path, checkpoint, "--batch-size", "3", stdin="no\n")
+    assert refused.returncode != 0
+    assert checkpoint.read_bytes() == original  # not modified
+
+    # Typing REBIND migrates it: the run completes and the save becomes v1, with
+    # the original legacy bytes preserved alongside.
+    ok = _restore(tmp_path, checkpoint, "--batch-size", "3", "--timings",
+                  stdin="REBIND\n")
+    assert ok.returncode == 0, ok.stderr
+    assert checkpoint.read_bytes()[:8] == V1_MAGIC
+    assert (tmp_path / "legacy.bin.legacy").read_bytes() == original

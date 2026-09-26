@@ -655,6 +655,288 @@ static void pipeline_contract(bool checkpoint_only) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint / save-integrity contracts (save_format.hpp). Host-only, no GPU.
+// ---------------------------------------------------------------------------
+
+static std::string save_hex(const uint8_t* p, size_t n) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(digits[p[i] >> 4]);
+        out.push_back(digits[p[i] & 0xf]);
+    }
+    return out;
+}
+static void label_hash(const char* s, uint8_t out[32]) {
+    sha256(reinterpret_cast<const uint8_t*>(s), strlen(s), out);
+}
+
+static void save_sha256_contract() {
+    uint8_t d[32];
+    sha256(reinterpret_cast<const uint8_t*>(""), 0, d);
+    require(save_hex(d, 32) ==
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sha256 empty-string vector differs");
+    sha256(reinterpret_cast<const uint8_t*>("abc"), 3, d);
+    require(save_hex(d, 32) ==
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "sha256 \"abc\" vector differs");
+    const char* m =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    sha256(reinterpret_cast<const uint8_t*>(m), strlen(m), d);
+    require(save_hex(d, 32) ==
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            "sha256 448-bit vector differs");
+}
+
+static void save_roundtrip_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "tokens.txt", "wallet.key", '|', th, wh, yh,
+                    111, 222, 333, 4, 5);
+    const char* path = ".cuda-build/save-roundtrip.bin";
+    require(save_record_v1(path, r), "v1 save failed");
+    SaveRecordV1 got;
+    require(load_record_v1(path, got), "v1 load failed");
+    require(memcmp(&r, &got, sizeof(r)) == 0, "v1 roundtrip differs");
+    require(got.combo_idx == 111 && got.perm_idx == 4 && got.typo_idx == 5,
+            "v1 progress fields lost");
+    require(verify_record_checksum(got), "v1 checksum invalid");
+}
+
+static void save_identity_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 10, 0, 0, 0);
+    require(memcmp(r.magic, SAVE_MAGIC_V1, 8) == 0, "magic not written");
+    require(r.format_version == SAVE_FORMAT_VERSION, "format version not written");
+    require(r.tool_version == SAVE_TOOL_VERSION, "tool version not written");
+    require(r.delimiter == ' ', "delimiter not bound");
+    require(memcmp(r.tokenlist_hash, th, 32) == 0, "token-list hash not bound");
+    require(memcmp(r.wallet_id_hash, wh, 32) == 0, "wallet hash not bound");
+    require(memcmp(r.typo_hash, yh, 32) == 0, "typo hash not bound");
+}
+
+static void save_reject_tokenlist_contract() {
+    uint8_t tA[32], tB[32], wh[32], yh[32];
+    label_hash("tokA", tA); label_hash("tokB", tB);
+    label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', tA, wh, yh, 0, 100, 0, 0, 0);
+    require(validate_save(r, tB, wh, ' ', yh, 100) == SaveMismatch::Tokenlist,
+            "different token list with equal combo count was not rejected");
+    require(validate_save(r, tA, wh, ' ', yh, 100) == SaveMismatch::None,
+            "matching token list was rejected");
+}
+
+static void save_reject_wallet_contract() {
+    uint8_t th[32], wA[32], wB[32], yh[32];
+    label_hash("tok", th); label_hash("walA", wA); label_hash("walB", wB);
+    label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wA, yh, 0, 100, 0, 0, 0);
+    require(validate_save(r, th, wB, ' ', yh, 100) == SaveMismatch::Wallet,
+            "different wallet was not rejected");
+    require(validate_save(r, th, wA, ' ', yh, 100) == SaveMismatch::None,
+            "matching wallet was rejected");
+}
+
+static void save_reject_delimiter_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    require(validate_save(r, th, wh, '|', yh, 100) == SaveMismatch::Delimiter,
+            "different delimiter was not rejected");
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::None,
+            "matching delimiter was rejected");
+}
+
+static void save_reject_typos_contract() {
+    uint8_t th[32], wh[32], yA[32], yB[32];
+    label_hash("tok", th); label_hash("wal", wh);
+    TypoConfig a; a.max_typos = 2; a.swap = true; a.insert_charset = "xy";
+    TypoConfig b = a; b.insert_charset = "xz";  // charset affects the space
+    typo_hash(a, yA); typo_hash(b, yB);
+    require(memcmp(yA, yB, 32) != 0, "typo serialization ignores insert charset");
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yA, 0, 100, 0, 0, 0);
+    require(validate_save(r, th, wh, ' ', yB, 100) == SaveMismatch::Typos,
+            "different typo options were not rejected");
+    require(validate_save(r, th, wh, ' ', yA, 100) == SaveMismatch::None,
+            "matching typo options were rejected");
+}
+
+static void save_detect_corruption_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 7, 100, 9, 1, 2);
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::None,
+            "valid record rejected");
+    r.combo_idx ^= 0x1;  // flip a bit without recomputing the checksum
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::Corrupt,
+            "corrupted record was not detected");
+}
+
+static void save_atomic_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 a, b;
+    build_record_v1(a, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    build_record_v1(b, "t", "w", ' ', th, wh, yh, 2, 100, 2, 0, 0);
+    const char* path = ".cuda-build/save-atomic.bin";
+    std::string prev = std::string(path) + ".prev";
+    remove(path); remove(prev.c_str());
+    require(save_record_v1(path, a), "initial save failed");
+    for (WriteFault fault : {WriteFault::ShortWrite, WriteFault::FlushFail,
+                             WriteFault::RenameFail}) {
+        require(!save_record_v1(path, b, fault),
+                "a faulted save falsely reported success");
+        SaveRecordV1 got;
+        require(load_record_v1(path, got),
+                "primary save missing after a faulted write");
+        require(got.combo_idx == 1,
+                "a faulted write corrupted the primary save");
+    }
+    require(save_record_v1(path, b), "replacement save failed");
+    SaveRecordV1 got;
+    require(load_record_v1(path, got) && got.combo_idx == 2,
+            "atomic replace did not take effect");
+}
+
+static void save_prev_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 a, b;
+    build_record_v1(a, "t", "w", ' ', th, wh, yh, 10, 100, 10, 0, 0);
+    build_record_v1(b, "t", "w", ' ', th, wh, yh, 20, 100, 20, 0, 0);
+    const char* path = ".cuda-build/save-prev.bin";
+    std::string prev = std::string(path) + ".prev";
+    remove(path); remove(prev.c_str());
+    require(save_record_v1(path, a), "save A failed");
+    require(save_record_v1(path, b), "save B failed");
+    SaveRecordV1 cur, old;
+    require(load_record_v1(path, cur) && cur.combo_idx == 20,
+            "current save is not the latest generation");
+    require(load_record_v1(prev.c_str(), old) && old.combo_idx == 10,
+            "previous generation was not retained");
+}
+
+static void save_migrate_1064_contract() {
+    SaveState s{};
+    s.combo_idx = 123; s.total_combos = 1000; s.passwords_checked = 456;
+    s.perm_idx = 7; s.typo_idx = 8;
+    strncpy(s.tokenlist, "t", 511); strncpy(s.wallet, "w", 511);
+    const char* path = ".cuda-build/save-legacy-1064.bin";
+    save_progress(path, s);
+    require(detect_save_kind(path) == SaveKind::Legacy1064,
+            "1064-byte save not detected as legacy");
+    SaveState r{};
+    require(load_progress(path, r), "legacy 1064 load failed");
+    require(r.combo_idx == 123 && r.perm_idx == 7 && r.typo_idx == 8
+            && r.passwords_checked == 456,
+            "legacy 1064 indices not preserved");
+}
+
+static void save_migrate_1048_contract() {
+    SaveState s{};
+    s.combo_idx = 321; s.total_combos = 2000; s.passwords_checked = 654;
+    s.perm_idx = 9; s.typo_idx = 9;
+    const char* path = ".cuda-build/save-legacy-1048.bin";
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(&s), OLD_SAVE_STATE_SIZE);
+    }
+    require(detect_save_kind(path) == SaveKind::Legacy1048,
+            "1048-byte save not detected as legacy");
+    SaveState r{};
+    require(load_progress(path, r), "legacy 1048 load failed");
+    require(r.combo_idx == 321 && r.passwords_checked == 654
+            && r.perm_idx == 0 && r.typo_idx == 0,
+            "legacy 1048 defaults changed");
+}
+
+static void save_rebind_confirm_contract() {
+    require(rebind_confirmed("REBIND"), "exact confirmation token not accepted");
+    require(!rebind_confirmed(""), "empty input accepted as confirmation");
+    require(!rebind_confirmed("rebind"), "lowercase accepted as confirmation");
+    require(!rebind_confirmed("YES"), "unrelated token accepted as confirmation");
+    require(!rebind_confirmed("REBIND "), "padded token accepted as confirmation");
+}
+
+static void save_reject_badmagic_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    r.magic[0] = 'X';  // magic is checked before anything else
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::BadMagic,
+            "record with wrong magic was not rejected");
+}
+
+static void save_reject_badversion_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    r.format_version = SAVE_FORMAT_VERSION + 1;  // a newer format we cannot read
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::BadVersion,
+            "record from a newer tool version was not rejected");
+}
+
+static void save_reject_combocount_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    require(validate_save(r, th, wh, ' ', yh, 200) == SaveMismatch::ComboCount,
+            "identity match with a different combo count was not rejected");
+}
+
+static void save_detect_unknown_contract() {
+    const char* path = ".cuda-build/save-unknown.bin";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "garbage";  // wrong size, no magic
+    }
+    require(detect_save_kind(path) == SaveKind::Unknown,
+            "short garbage file not classified as unknown");
+    { std::ofstream f(path, std::ios::binary | std::ios::trunc); }  // zero length
+    require(detect_save_kind(path) == SaveKind::Unknown,
+            "zero-length file not classified as unknown");
+    require(detect_save_kind(".cuda-build/save-missing.bin") == SaveKind::Unknown,
+            "missing file not classified as unknown");
+}
+
+static void save_rebind_roundtrip_contract() {
+    SaveState legacy{};
+    legacy.combo_idx = 999; legacy.total_combos = 5000;
+    legacy.passwords_checked = 7777; legacy.perm_idx = 3; legacy.typo_idx = 4;
+    const char* lpath = ".cuda-build/save-rebind-legacy.bin";
+    save_progress(lpath, legacy);
+    SaveState read{};
+    require(load_progress(lpath, read), "legacy read failed");
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, read.combo_idx,
+                    read.total_combos, read.passwords_checked,
+                    read.perm_idx, read.typo_idx);
+    const char* vpath = ".cuda-build/save-rebind-v1.bin";
+    require(save_record_v1(vpath, r), "v1 save after rebind failed");
+    SaveRecordV1 got;
+    require(load_record_v1(vpath, got), "v1 load after rebind failed");
+    require(validate_save(got, th, wh, ' ', yh, read.total_combos)
+            == SaveMismatch::None, "rebound record failed its own validation");
+    require(got.combo_idx == 999 && got.perm_idx == 3 && got.typo_idx == 4
+            && got.passwords_checked == 7777,
+            "rebind lost the resume indices");
+}
+
 static int run_host_contract(const std::string& name) {
     if (name == "assembly") assembly_contract();
     else if (name == "resume") resume_contract();
@@ -673,6 +955,24 @@ static int run_host_contract(const std::string& name) {
     else if (name == "cancel") cancel_contract();
     else if (name == "parallel_cancel") parallel_cancel_contract();
     else if (name == "legacy") legacy_contract();
+    else if (name == "save_sha256") save_sha256_contract();
+    else if (name == "save_roundtrip") save_roundtrip_contract();
+    else if (name == "save_identity") save_identity_contract();
+    else if (name == "save_reject_tokenlist") save_reject_tokenlist_contract();
+    else if (name == "save_reject_wallet") save_reject_wallet_contract();
+    else if (name == "save_reject_delimiter") save_reject_delimiter_contract();
+    else if (name == "save_reject_typos") save_reject_typos_contract();
+    else if (name == "save_detect_corruption") save_detect_corruption_contract();
+    else if (name == "save_reject_badmagic") save_reject_badmagic_contract();
+    else if (name == "save_reject_badversion") save_reject_badversion_contract();
+    else if (name == "save_reject_combocount") save_reject_combocount_contract();
+    else if (name == "save_detect_unknown") save_detect_unknown_contract();
+    else if (name == "save_atomic") save_atomic_contract();
+    else if (name == "save_prev") save_prev_contract();
+    else if (name == "save_migrate_1064") save_migrate_1064_contract();
+    else if (name == "save_migrate_1048") save_migrate_1048_contract();
+    else if (name == "save_rebind_confirm") save_rebind_confirm_contract();
+    else if (name == "save_rebind_roundtrip") save_rebind_roundtrip_contract();
     else if (name == "md5") md5_contract();
     else if (name == "pipeline") pipeline_contract(false);
     else if (name == "checkpoint") pipeline_contract(true);

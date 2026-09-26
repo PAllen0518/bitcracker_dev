@@ -910,32 +910,9 @@ static void typo_stage_insert(const std::vector<TypoCandidate>& in, const TypoCo
 // Save / restore
 // ---------------------------------------------------------------------------
 
-struct SaveState {
-    char     tokenlist[512];
-    char     wallet[512];
-    uint64_t combo_idx;
-    uint64_t total_combos;
-    uint64_t passwords_checked;
-    uint64_t perm_idx;
-    uint64_t typo_idx;
-};
-
-// Older saves ended after passwords_checked. They still restore at combo
-// precision; new saves include perm_idx and typo_idx for exact resumes.
-static const size_t OLD_SAVE_STATE_SIZE = 512 + 512 + sizeof(uint64_t) * 3;
-
-static void save_progress(const char* path, const SaveState& s) {
-    FILE* f=fopen(path,"wb");
-    if (f) { fwrite(&s,sizeof(s),1,f); fclose(f); }
-}
-static bool load_progress(const char* path, SaveState& s) {
-    FILE* f=fopen(path,"rb");
-    if (!f) return false;
-    memset(&s, 0, sizeof(s));
-    size_t n=fread(&s,1,sizeof(s),f);
-    fclose(f);
-    return n==sizeof(s) || n==OLD_SAVE_STATE_SIZE;
-}
+// The save format (legacy struct + v1 integrity record) lives in a standalone
+// header so it can be unit tested on the host without a GPU.
+#include "save_format.hpp"
 
 // Write the recovered password to a file instead of the terminal, so it
 // doesn't persist in scrollback, tmux/screen logs, or redirected output.
@@ -1051,9 +1028,32 @@ static int run_application(int argc, char** argv) {
     }
 
     SaveState state = {};
+    SaveRecordV1 v1_record{};
+    SaveKind save_kind = SaveKind::Unknown;
     if (restore_path) {
-        if (!load_progress(restore_path, state)) {
-            fprintf(stderr,"Cannot load save: %s\n",restore_path); return 1;
+        save_kind = detect_save_kind(restore_path);
+        if (save_kind == SaveKind::V1) {
+            if (!load_record_v1(restore_path, v1_record)) {
+                fprintf(stderr, "Cannot load save (corrupt or unreadable v1 header): %s\n",
+                        restore_path);
+                return 1;
+            }
+            state.combo_idx         = v1_record.combo_idx;
+            state.total_combos      = v1_record.total_combos;
+            state.passwords_checked = v1_record.passwords_checked;
+            state.perm_idx          = v1_record.perm_idx;
+            state.typo_idx          = v1_record.typo_idx;
+            strncpy(state.tokenlist, v1_record.tokenlist_path, 511);
+            strncpy(state.wallet,    v1_record.wallet_path,    511);
+        } else if (save_kind == SaveKind::Legacy1064
+                   || save_kind == SaveKind::Legacy1048) {
+            if (!load_progress(restore_path, state)) {
+                fprintf(stderr, "Cannot load save: %s\n", restore_path);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "Cannot load save: unrecognized format: %s\n", restore_path);
+            return 1;
         }
         if (!wallet_path)    wallet_path    = state.wallet;
         if (!tokenlist_path) tokenlist_path = state.tokenlist;
@@ -1090,6 +1090,14 @@ static int run_application(int argc, char** argv) {
         total_combos *= (uint64_t)(l.tokens.size() + (l.required ? 0 : 1));
     printf("Total combos: %llu\n", (unsigned long long)total_combos);
 
+    // Identity bindings for the current inputs (spec: token-list bytes, wallet
+    // identity, delimiter, typo options). Bound into every v1 save and checked
+    // on restore.
+    uint8_t cur_tokenlist_hash[32], cur_wallet_hash[32], cur_typo_hash[32];
+    const bool have_tokenlist_hash = sha256_file(tokenlist_path, cur_tokenlist_hash);
+    wallet_id_hash(h_salt, h_enc, cur_wallet_hash);
+    typo_hash(typo_cfg, cur_typo_hash);
+
     if (!restore_path) {
         strncpy(state.tokenlist, tokenlist_path, 511);
         strncpy(state.wallet,    wallet_path,    511);
@@ -1098,19 +1106,88 @@ static int run_application(int argc, char** argv) {
         state.passwords_checked = 0;
         state.perm_idx          = 0;
         state.typo_idx          = 0;
-    } else if (total_combos != state.total_combos) {
-        // The tokenlist re-parsed to a different combo count than the save file
-        // expects - either the tokenlist was edited, or --delimiter doesn't match
-        // what the original run used. Resuming anyway would silently check the
-        // wrong passwords against a stale combo_idx, so refuse instead.
-        fprintf(stderr,
-            "\nFATAL: re-parsed tokenlist yields %llu combos but the save file expects %llu.\n"
-            "The tokenlist file or --delimiter must have changed since this save was written.\n"
-            "Pass the same --delimiter used originally, and don't edit the tokenlist between\n"
-            "save and restore.\n",
-            (unsigned long long)total_combos, (unsigned long long)state.total_combos);
-        return 1;
+    } else if (save_kind == SaveKind::V1) {
+        // Fail loud: refuse to resume unless every binding matches this save.
+        if (!have_tokenlist_hash) {
+            fprintf(stderr, "\nFATAL: cannot read token list to validate save: %s\n",
+                    tokenlist_path);
+            return 1;
+        }
+        SaveMismatch mismatch = validate_save(
+            v1_record, cur_tokenlist_hash, cur_wallet_hash,
+            static_cast<uint8_t>(delimiter), cur_typo_hash, total_combos);
+        if (mismatch != SaveMismatch::None) {
+            fprintf(stderr,
+                "\nFATAL: refusing to resume - %s.\n"
+                "Resuming would search a different space than this save covers.\n"
+                "Restore with the exact wallet, token list, --delimiter and typo\n"
+                "options this save was created with.\n",
+                mismatch_message(mismatch));
+            return 1;
+        }
+    } else {
+        // Legacy save: it carries no bindings, so require a one-time, interactive
+        // confirmed re-bind before trusting it. The combo-count check is the only
+        // integrity signal the legacy format offers.
+        if (total_combos != state.total_combos) {
+            fprintf(stderr,
+                "\nFATAL: re-parsed tokenlist yields %llu combos but the save file expects %llu.\n"
+                "The tokenlist file or --delimiter must have changed since this save was written.\n"
+                "Pass the same --delimiter used originally, and don't edit the tokenlist between\n"
+                "save and restore.\n",
+                (unsigned long long)total_combos, (unsigned long long)state.total_combos);
+            return 1;
+        }
+        if (!have_tokenlist_hash) {
+            fprintf(stderr, "\nFATAL: cannot read token list to re-bind save: %s\n",
+                    tokenlist_path);
+            return 1;
+        }
+        char hexbuf[65];
+        const double percent = total_combos > 0
+            ? 100.0 * state.combo_idx / total_combos : 100.0;
+        printf("\nThis is a legacy save with no integrity binding. It will be re-bound to:\n");
+        printf("  token-list sha256 : %s\n", sha256_hex(cur_tokenlist_hash, hexbuf));
+        printf("  wallet-id  sha256 : %s\n", sha256_hex(cur_wallet_hash, hexbuf));
+        printf("  typo-opts  sha256 : %s\n", sha256_hex(cur_typo_hash, hexbuf));
+        printf("  delimiter         : '%c'\n", delimiter);
+        printf("  resume at combo #%llu perm #%llu typo #%llu (%.3fT done, %.2f%%)\n",
+               (unsigned long long)state.combo_idx,
+               (unsigned long long)state.perm_idx,
+               (unsigned long long)state.typo_idx,
+               state.passwords_checked / 1e12, percent);
+        printf("Type REBIND to confirm and upgrade this save to v1, anything else to abort: ");
+        fflush(stdout);
+        char line[64] = {0};
+        std::string answer;
+        if (fgets(line, sizeof(line), stdin)) {
+            answer = line;
+            while (!answer.empty()
+                   && (answer.back() == '\n' || answer.back() == '\r')) {
+                answer.pop_back();
+            }
+        }
+        if (!rebind_confirmed(answer)) {
+            fprintf(stderr, "\nAborted: save not re-bound and not modified.\n");
+            return 1;
+        }
+        // Preserve the original legacy bytes before the first v1 write replaces
+        // them, so a mistaken re-bind can still be recovered.
+        copy_file_durable(restore_path,
+                          (std::string(restore_path) + ".legacy").c_str());
+        printf("Re-bind confirmed; the next save will be written in v1 format.\n");
     }
+
+    // Build and atomically write a v1 save from the current identity + progress.
+    auto write_v1_save = [&](const char* path) -> bool {
+        SaveRecordV1 rec;
+        build_record_v1(rec, tokenlist_path, wallet_path,
+                        static_cast<uint8_t>(delimiter),
+                        cur_tokenlist_hash, cur_wallet_hash, cur_typo_hash,
+                        state.combo_idx, total_combos, state.passwords_checked,
+                        state.perm_idx, state.typo_idx);
+        return save_record_v1(path, rec);
+    };
 
     ProducerState producer_state(batch_size, !synchronous);
     producer_state.lines = &lines;
@@ -1185,7 +1262,9 @@ static int run_application(int argc, char** argv) {
             last_report = hrclock::now();
         }
         if (autosave_path && secs_since(last_save) >= 30.0) {
-            save_progress(autosave_path, state);
+            if (!write_v1_save(autosave_path)) {
+                fprintf(stderr, "\nWARNING: autosave failed; previous save retained.\n");
+            }
             last_save = hrclock::now();
         }
     }
@@ -1195,7 +1274,9 @@ static int run_application(int argc, char** argv) {
         state.combo_idx = total_combos;
         state.perm_idx = state.typo_idx = 0;
     }
-    if (autosave_path) save_progress(autosave_path, state);
+    if (autosave_path && !write_v1_save(autosave_path)) {
+        fprintf(stderr, "\nWARNING: final save failed; previous save retained.\n");
+    }
     const double elapsed = secs_since(start_time);
     const uint64_t checked = state.passwords_checked - session_base;
     if (!found_password) {
