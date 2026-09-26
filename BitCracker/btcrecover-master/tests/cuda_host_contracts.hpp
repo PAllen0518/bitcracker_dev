@@ -1,6 +1,7 @@
 // Host and pipeline acceptance tests, compiled only into the native harness.
 #pragma once
 #include <set>
+#include <future>
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -13,7 +14,7 @@ struct ProducerGuard {
         : state(value), thread(producer_thread, &value, base) {}
     ~ProducerGuard() {
         state.request_stop();
-        thread.join();
+        if (thread.joinable()) thread.join();
     }
 };
 
@@ -35,6 +36,8 @@ static uint64_t combo_count(const std::vector<TokenLine>& lines) {
 struct Capture {
     std::vector<std::string> passwords;
     std::vector<SaveState> checkpoints;
+    uint64_t chunk_allocations = 0;
+    uint64_t block_copies = 0;
 };
 
 static Capture collect_candidates(
@@ -64,7 +67,10 @@ static Capture collect_candidates(
         result.checkpoints.push_back(point);
         state.recycle(std::move(batch));
     }
+    guard.thread.join();
     state.rethrow_failure();
+    result.chunk_allocations = state.chunk_allocations.load();
+    result.block_copies = state.block_copies;
     require(state.allocated_batches() == 3, "pool must remain bounded");
     return result;
 }
@@ -195,6 +201,275 @@ static void parallel_contract() {
             full.passwords.end());
         require(resumed.passwords == suffix, "parallel resume suffix differs");
     }
+}
+
+static void require_same_capture(const Capture& actual,
+                                 const Capture& expected) {
+    require(actual.passwords == expected.passwords,
+            "candidate bytes/order differ");
+    require(actual.checkpoints.size() == expected.checkpoints.size(),
+            "batch boundaries differ");
+    for (size_t i = 0; i < actual.checkpoints.size(); ++i) {
+        const auto& a = actual.checkpoints[i];
+        const auto& b = expected.checkpoints[i];
+        require(a.combo_idx == b.combo_idx && a.perm_idx == b.perm_idx
+                && a.typo_idx == b.typo_idx
+                && a.passwords_checked == b.passwords_checked,
+                "checkpoint differs at batch boundary");
+    }
+}
+
+static void throughput_contract(bool reuse) {
+    std::vector<TokenLine> lines(6, {{"aa", "bb", "cc"}, true, false, 0});
+    const TypoConfig config;
+    const auto serial = collect_candidates(lines, config, {}, 8193, 1);
+    const auto parallel = collect_candidates(lines, config, {}, 8193, 4);
+    require_same_capture(parallel, serial);
+    if (reuse) {
+        require(parallel.chunk_allocations <= 4 * 4 * 3,
+                "chunk storage allocations grow with emitted chunks");
+    } else {
+        require(parallel.block_copies > 0,
+                "parallel merge did not copy candidate blocks");
+        require(parallel.block_copies < parallel.passwords.size() / 100,
+                "merge still copies one candidate at a time");
+    }
+}
+
+static void block_boundaries_contract() {
+    const std::vector<std::vector<TokenLine>> small_cases{
+        {}, {{{""}, true, false, 0}}, {{{"a"}, true, false, 0}},
+        {{{"anchor"}, true, true, 0}}
+    };
+    for (const auto& lines : small_cases) {
+        const auto serial = collect_candidates(lines, TypoConfig{}, {}, 1, 1);
+        require_same_capture(
+            collect_candidates(lines, TypoConfig{}, {}, 1, 4), serial);
+    }
+    std::vector<TokenLine> lines(6, {{"a", "B"}, true, false, 0});
+    const TypoConfig config;
+    for (int capacity : {1, 7, 8191, 8192, 8193, 16385}) {
+        const auto serial = collect_candidates(lines, config, {}, capacity, 1);
+        for (int workers : {2, 4, 8}) {
+            require_same_capture(
+                collect_candidates(lines, config, {}, capacity, workers),
+                serial);
+        }
+    }
+}
+
+static Capture raw_block_capture(bool blocks, int capacity) {
+    ProducerState state(capacity, false);
+    ParallelMerge merge(state, 0, 1);
+    auto emit = [](auto& sink) {
+        const std::array<int, 10> lengths{
+            {0, 31, 32, 33, 63, 64, 65, 127, 128, 129}};
+        for (uint64_t i = 0; i < 22000 && !sink.stopped(); ++i) {
+            const int length = lengths[i % lengths.size()];
+            if (!sink.append(
+                    length, {i + 1, i % 17, i % 5}, [&](uint8_t* out) {
+                    memset(out, static_cast<int>(i % 251), length);
+                })) return;
+            if (i % 1024 == 0) sink.set_next({i + 10, 99, 7});
+        }
+        sink.set_next({99999, 0, 0});
+    };
+    auto producer = std::async(std::launch::async, [&] {
+        if (blocks) {
+            auto worker = std::async(std::launch::async, [&] {
+                try {
+                    ChunkSink sink(merge, 0);
+                    emit(sink);
+                    sink.finish();
+                } catch (...) {
+                    state.request_stop();
+                    merge.abort();
+                    throw;
+                }
+            });
+            try { merge.run(); }
+            catch (...) { state.request_stop(); merge.abort(); throw; }
+            merge.abort();
+            worker.get();
+            merge.finish();
+        } else {
+            BatchWriter writer(state, 0);
+            emit(writer);
+            writer.flush();
+        }
+        state.finish();
+    });
+    Capture result;
+    while (auto batch = state.take_ready(true)) {
+        for (int i = 0; i < batch->count; ++i) {
+            result.passwords.emplace_back(reinterpret_cast<const char*>(
+                batch->pw_data.data()
+                    + static_cast<size_t>(i) * batch->stride),
+                batch->pw_lens[i]);
+        }
+        SaveState point{};
+        point.combo_idx = batch->next_combo_idx;
+        point.perm_idx = batch->next_perm_idx;
+        point.typo_idx = batch->next_typo_idx;
+        point.passwords_checked = batch->passwords_total + batch->count;
+        result.checkpoints.push_back(point);
+        state.recycle(std::move(batch));
+    }
+    producer.get();
+    return result;
+}
+
+static void raw_blocks_contract() {
+    for (int capacity : {1, 3, 7, 8192, 8193, 32768}) {
+        require_same_capture(raw_block_capture(true, capacity),
+                             raw_block_capture(false, capacity));
+    }
+}
+
+static void pool_ownership_contract() {
+    ProducerState state(8, false);
+    ParallelMerge merge(state, 0, 1);
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto chunk = merge.acquire(0);
+        chunk->reset(0, i);
+        chunk->append(1, {i + 1, 0, 0}, [&](uint8_t* out) {
+            *out = static_cast<uint8_t>(i + 1);
+        });
+        chunk->set_last(i == 3);
+        merge.publish(std::move(chunk));
+    }
+    std::promise<void> entered;
+    auto blocked = std::async(std::launch::async, [&] {
+        entered.set_value();
+        auto chunk = merge.acquire(0);
+        if (chunk) {
+            chunk->reset(42, 0);
+            chunk->append(1, {42, 0, 0}, [](uint8_t* out) { *out = 255; });
+        }
+        return chunk != nullptr;
+    });
+    entered.get_future().wait();
+    const bool waited = blocked.wait_for(std::chrono::milliseconds(30))
+        == std::future_status::timeout;
+    if (!waited) {
+        state.request_stop();
+        merge.abort();
+        blocked.get();
+        require(false, "pool exceeded the per-worker ownership limit");
+    }
+    merge.run();
+    require(blocked.get(), "pool did not return released storage");
+    merge.finish();
+    auto batch = state.take_ready(false);
+    require(batch && batch->count == 4, "pool lost queued candidates");
+    for (int i = 0; i < 4; ++i) {
+        const auto value = batch->pw_data[
+            static_cast<size_t>(i) * batch->stride];
+        require(value == i + 1,
+                "worker overwrote a chunk before merge completed");
+    }
+    require(state.chunk_allocations.load() == 12, "released chunk not reused");
+}
+
+static void pool_progress_contract() {
+    ProducerState state(16, false);
+    state.producers = 2;
+    ParallelMerge merge(state, 0, 2);
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto chunk = merge.acquire(1);
+        chunk->reset(1, i);
+        chunk->append(1, {i + 1, 0, 0}, [&](uint8_t* out) {
+            *out = static_cast<uint8_t>(i + 1);
+        });
+        merge.publish(std::move(chunk));
+    }
+    std::promise<void> entered;
+    auto later = std::async(std::launch::async, [&] {
+        entered.set_value();
+        auto chunk = merge.acquire(1);
+        if (!chunk) return;
+        chunk->reset(1, 4);
+        chunk->append(1, {100, 0, 0}, [](uint8_t* out) { *out = 99; });
+        chunk->set_last(true);
+        merge.publish(std::move(chunk));
+    });
+    entered.get_future().wait();
+    // Owner zero retains a reservation when later work exhausts owner one.
+    auto first = merge.acquire(0);
+    first->reset(0, 0);
+    first->append(1, {1, 0, 0}, [](uint8_t* out) { *out = 42; });
+    first->set_last(true);
+    merge.publish(std::move(first));
+    merge.run();
+    later.get();
+    merge.finish();
+    auto batch = state.take_ready(false);
+    require(batch && batch->count == 6, "pool progress lost work");
+    const std::array<int, 6> expected{{42, 1, 2, 3, 4, 99}};
+    for (size_t i = 0; i < expected.size(); ++i) {
+        require(batch->pw_data[i * batch->stride] == expected[i],
+                "out-of-order chunk escaped merge");
+    }
+}
+
+static void seeded_blocks_contract() {
+    uint32_t seed = 20260923;
+    auto draw = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+    for (int trial = 0; trial < 16; ++trial) {
+        std::vector<TokenLine> lines;
+        for (int i = 0; i < 4; ++i) {
+            TokenLine line{{}, (draw() % 2) != 0, false, 0};
+            const int alternatives = 1 + draw() % 3;
+            for (int j = 0; j < alternatives; ++j) {
+                const std::array<int, 6> lengths{{1, 15, 16, 17, 31, 32}};
+                line.tokens.emplace_back(lengths[draw() % lengths.size()],
+                                         static_cast<char>('a' + i + j));
+            }
+            lines.push_back(std::move(line));
+        }
+        lines.push_back({{"S"}, true, true, 0});
+        lines.push_back({{"E"}, true, true, -1});
+        TypoConfig config;
+        config.max_typos = 1;
+        config.del = trial % 2 == 0;
+        config.repeat = trial % 3 == 0;
+        const int capacity = trial % 2 == 0 ? 7 : 8193;
+        const auto serial = collect_candidates(lines, config, {}, capacity, 1);
+        for (int workers : {2, 4, 8}) {
+            require_same_capture(
+                collect_candidates(lines, config, {}, capacity, workers),
+                serial);
+        }
+        if (!serial.checkpoints.empty()) {
+            const auto& point =
+                serial.checkpoints[serial.checkpoints.size() / 2];
+            const auto resumed = collect_candidates(lines, config, point,
+                                                    capacity, 4);
+            const std::vector<std::string> suffix(
+                serial.passwords.begin() + point.passwords_checked,
+                serial.passwords.end());
+            require(resumed.passwords == suffix, "seeded resume lost suffix");
+        }
+    }
+}
+
+static void pool_cancel_contract() {
+    ProducerState state(8, false);
+    ParallelMerge merge(state, 0, 1);
+    std::vector<std::unique_ptr<GenChunk>> held;
+    for (int i = 0; i < 4; ++i) held.push_back(merge.acquire(0));
+    std::promise<void> entered;
+    auto blocked = std::async(std::launch::async, [&] {
+        entered.set_value();
+        return merge.acquire(0) == nullptr;
+    });
+    auto coordinator = std::async(std::launch::async, [&] { merge.run(); });
+    entered.get_future().wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    state.request_stop();
+    merge.abort();
+    require(blocked.get(), "stopped pool handed out a chunk");
+    coordinator.get();
 }
 
 static void mixed_contract() {
@@ -384,6 +659,14 @@ static int run_host_contract(const std::string& name) {
     if (name == "assembly") assembly_contract();
     else if (name == "resume") resume_contract();
     else if (name == "parallel") parallel_contract();
+    else if (name == "block_merge") throughput_contract(false);
+    else if (name == "chunk_reuse") throughput_contract(true);
+    else if (name == "block_boundaries") block_boundaries_contract();
+    else if (name == "raw_blocks") raw_blocks_contract();
+    else if (name == "pool_ownership") pool_ownership_contract();
+    else if (name == "pool_progress") pool_progress_contract();
+    else if (name == "pool_cancel") pool_cancel_contract();
+    else if (name == "seeded_blocks") seeded_blocks_contract();
     else if (name == "pool") pool_contract();
     else if (name == "mixed_lengths") mixed_contract();
     else if (name == "bounded_typos") bounded_contract();

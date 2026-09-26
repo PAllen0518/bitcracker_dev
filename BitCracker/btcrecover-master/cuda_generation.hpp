@@ -88,6 +88,45 @@ public:
         ++total_;
         return true;
     }
+    bool append_block(const uint8_t* data, const uint32_t* lengths,
+                      const NextCandidate* next, size_t count,
+                      uint32_t source_stride) {
+        size_t offset = 0;
+        while (offset < count) {
+            if (state_.stopped()) return false;
+            if (current_ && current_->full() && !flush()) return false;
+            if (!current_) {
+                const auto wait_start = hrclock::now();
+                current_ = state_.acquire(total_);
+                waiting_ += secs_since(wait_start);
+                if (!current_) return false;
+            }
+            const size_t take = std::min(count - offset,
+                static_cast<size_t>(current_->capacity - current_->count));
+            const auto maximum = *std::max_element(
+                lengths + offset, lengths + offset + take);
+            current_->ensure_stride(static_cast<int>(maximum));
+            auto* destination = current_->pw_data.data()
+                + static_cast<size_t>(current_->count) * current_->stride;
+            const auto* source = data + offset * source_stride;
+            if (current_->stride == source_stride) {
+                memcpy(destination, source, take * source_stride);
+                ++state_.block_copies;
+            } else {
+                for (size_t i = 0; i < take; ++i) {
+                    memcpy(destination + i * current_->stride,
+                           source + i * source_stride, lengths[offset + i]);
+                }
+            }
+            memcpy(current_->pw_lens.data() + current_->count,
+                   lengths + offset, take * sizeof(uint32_t));
+            current_->count += static_cast<int>(take);
+            total_ += take;
+            offset += take;
+            set_next(next[offset - 1]);
+        }
+        return true;
+    }
     void set_next(NextCandidate next) {
         if (!current_) return;
         current_->next_combo_idx = next.combo;
@@ -208,176 +247,271 @@ static bool decode_combo(
 // identical to the single-producer path.
 // ---------------------------------------------------------------------------
 
-// A bounded slice of recorded generation. A work unit is a contiguous run of
-// combinations (see PARALLEL_UNIT_COMBOS); its candidates are packed into chunks
-// of ~PARALLEL_CHUNK_CANDIDATES so that, no matter how small each combination
-// is, the merge's per-chunk locking and allocation are amortized over thousands
-// of candidates rather than paid per combination. Bytes for stored candidates
-// are concatenated; ops replay the exact append()/set_next() calls in order.
-struct GenChunk {
+constexpr size_t PARALLEL_CHUNK_CANDIDATES = 8192;
+constexpr uint64_t PARALLEL_UNIT_COMBOS = 16;
+constexpr size_t CHUNKS_PER_WORKER = 4;
+
+struct ChunkPosition {
     uint64_t unit = 0;
-    uint32_t seq = 0;
+    uint32_t sequence = 0;
     bool last = false;
-    size_t candidates = 0;
-    std::vector<uint8_t> bytes;
-    struct Op {
-        bool is_append;
-        int length;
-        NextCandidate next;
-    };
-    std::vector<Op> ops;
 };
 
-static const size_t PARALLEL_CHUNK_CANDIDATES = 8192;
-// Combinations per work unit. Chosen so tiny combinations (e.g. search60's
-// ~720 candidates each) still pack into full chunks, while common workloads
-// still yield far more units than worker threads.
-static const uint64_t PARALLEL_UNIT_COMBOS = 16;
+class GenChunk {
+public:
+    GenChunk(size_t owner, ProducerState& state)
+        : owner_(owner), state_(state), bytes_(PARALLEL_CHUNK_CANDIDATES * 32),
+          lengths_(PARALLEL_CHUNK_CANDIDATES),
+          next_(PARALLEL_CHUNK_CANDIDATES) {
+        state_.chunk_allocations.fetch_add(3);
+        record_growth();
+    }
+    ~GenChunk() noexcept { state_.chunk_live_bytes.fetch_sub(storage_); }
+    GenChunk(const GenChunk&) = delete;
+    GenChunk& operator=(const GenChunk&) = delete;
+    size_t owner() const noexcept { return owner_; }
+    size_t count() const noexcept { return count_; }
+    uint32_t stride() const noexcept { return stride_; }
+    const uint8_t* data() const noexcept { return bytes_.data(); }
+    const uint32_t* lengths() const noexcept { return lengths_.data(); }
+    const NextCandidate* next() const noexcept { return next_.data(); }
+    const ChunkPosition& position() const noexcept { return position_; }
+    bool has_prefix() const noexcept { return has_prefix_; }
+    NextCandidate prefix() const noexcept { return prefix_; }
+    void set_last(bool last) noexcept { position_.last = last; }
+    void reset(uint64_t unit, uint32_t sequence) noexcept {
+        position_ = {unit, sequence, false};
+        count_ = 0;
+        stride_ = 32;
+        has_prefix_ = false;
+    }
+    void set_next(NextCandidate next) noexcept {
+        if (count_) next_[count_ - 1] = next;
+        else {
+            prefix_ = next;
+            has_prefix_ = true;
+        }
+    }
+    template <class Write>
+    void append(int length, NextCandidate next, Write write) {
+        if (length < 1 || length > PW_MAX_LEN
+            || count_ == PARALLEL_CHUNK_CANDIDATES) {
+            throw std::logic_error("invalid chunk append");
+        }
+        const uint32_t required = length <= 32
+            ? 32 : (length <= 64 ? 64 : 128);
+        if (required > stride_) widen(required);
+        write(bytes_.data() + count_ * stride_);
+        lengths_[count_] = static_cast<uint32_t>(length);
+        next_[count_++] = next;
+    }
+private:
+    void record_growth() {
+        const uint64_t bytes = bytes_.capacity()
+            + lengths_.capacity() * sizeof(uint32_t)
+            + next_.capacity() * sizeof(NextCandidate);
+        const auto live = state_.chunk_live_bytes.fetch_add(bytes - storage_)
+            + bytes - storage_;
+        storage_ = bytes;
+        auto peak = state_.chunk_storage_bytes.load();
+        while (peak < live
+               && !state_.chunk_storage_bytes.compare_exchange_weak(
+                   peak, live)) {}
+    }
+    void widen(uint32_t required) {
+        const auto capacity = bytes_.capacity();
+        if (bytes_.size() < PARALLEL_CHUNK_CANDIDATES * required) {
+            bytes_.resize(PARALLEL_CHUNK_CANDIDATES * required);
+        }
+        if (bytes_.capacity() != capacity) {
+            state_.chunk_allocations.fetch_add(1);
+            record_growth();
+        }
+        for (size_t i = count_; i > 0; --i) {
+            memmove(bytes_.data() + (i - 1) * required,
+                    bytes_.data() + (i - 1) * stride_, lengths_[i - 1]);
+        }
+        stride_ = required;
+    }
+    size_t owner_;
+    ProducerState& state_;
+    std::vector<uint8_t> bytes_;
+    std::vector<uint32_t> lengths_;
+    std::vector<NextCandidate> next_;
+    ChunkPosition position_{};
+    size_t count_ = 0;
+    uint32_t stride_ = 32;
+    uint64_t storage_ = 0;
+    bool has_prefix_ = false;
+    NextCandidate prefix_{};
+};
 
 class ParallelMerge {
 public:
     ParallelMerge(ProducerState& state, uint64_t base, uint64_t num_units)
-        : state_(state), writer_(state, base), num_units_(num_units) {}
-
+        : state_(state), writer_(state, base), num_units_(num_units),
+          available_(std::max(1, state.producers)),
+          allocated_(available_.size(), 0) {
+        for (auto& bucket : available_) bucket.reserve(CHUNKS_PER_WORKER);
+    }
     bool stopped() const { return state_.stopped() || aborted_.load(); }
 
-    // Called by workers. Blocks under back-pressure, except the chunk the merge
-    // is currently waiting for is always admitted to guarantee progress.
-    void publish(GenChunk chunk) {
+    std::unique_ptr<GenChunk> acquire(size_t owner) {
+        if (owner >= available_.size()) {
+            throw std::logic_error("invalid owner");
+        }
+#ifdef MULTIBIT_DISABLE_CHUNK_POOL
+        if (stopped()) return nullptr;
+        return std::make_unique<GenChunk>(owner, state_);
+#else
         std::unique_lock<std::mutex> lock(mutex_);
         produce_.wait(lock, [&] {
-            return state_.stopped() || aborted_.load()
-                || buffered_candidates_ + chunk.candidates <= budget_
-                || (chunk.unit == expected_unit_ && chunk.seq == expected_seq_);
+            return stopped() || !available_[owner].empty()
+                || allocated_[owner] < CHUNKS_PER_WORKER;
         });
-        if (state_.stopped() || aborted_.load()) return;
-        buffered_candidates_ += chunk.candidates;
-        auto key = std::make_pair(chunk.unit, chunk.seq);
-        buffered_.emplace(key, std::move(chunk));
+        if (stopped()) return nullptr;
+        auto& bucket = available_[owner];
+        if (!bucket.empty()) {
+            auto chunk = std::move(bucket.back());
+            bucket.pop_back();
+            return chunk;
+        }
+        auto chunk = std::make_unique<GenChunk>(owner, state_);
+        ++allocated_[owner];
+        return chunk;
+#endif
+    }
+    void publish(std::unique_ptr<GenChunk> chunk) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto position = chunk->position();
+        produce_.wait(lock, [&] {
+            return stopped()
+                || buffered_candidates_ + chunk->count() <= budget_
+                || (position.unit == expected_unit_
+                    && position.sequence == expected_sequence_);
+        });
+        if (stopped()) return;
+        buffered_candidates_ += chunk->count();
+        auto key = std::make_pair(position.unit, position.sequence);
+        if (!buffered_.emplace(key, std::move(chunk)).second) {
+            throw std::logic_error("duplicate generation chunk");
+        }
         consume_.notify_one();
     }
-
-    // Runs on the coordinator thread until every unit is merged or a stop.
     void run() {
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_);
-            if (state_.stopped() || aborted_.load()) return;
-            if (expected_unit_ >= num_units_) return;
-            auto key = std::make_pair(expected_unit_, expected_seq_);
+            if (stopped() || expected_unit_ >= num_units_) return;
+            auto key = std::make_pair(expected_unit_, expected_sequence_);
             consume_.wait(lock, [&] {
-                return state_.stopped() || aborted_.load()
-                    || buffered_.count(key) != 0;
+                return stopped() || buffered_.count(key);
             });
-            if (state_.stopped() || aborted_.load()) return;
+            if (stopped()) return;
             auto it = buffered_.find(key);
-            GenChunk chunk = std::move(it->second);
+            auto chunk = std::move(it->second);
             buffered_.erase(it);
-            buffered_candidates_ -= chunk.candidates;
-            if (chunk.last) {
+            buffered_candidates_ -= chunk->count();
+            if (chunk->position().last) {
                 ++expected_unit_;
-                expected_seq_ = 0;
-            } else {
-                ++expected_seq_;
-            }
+                expected_sequence_ = 0;
+            } else ++expected_sequence_;
             produce_.notify_all();
             lock.unlock();
-            replay(chunk);
+            const auto start = hrclock::now();
+            replay(*chunk);
+            state_.merge_seconds += secs_since(start);
+            recycle(std::move(chunk));
         }
     }
-
     void abort() {
-        aborted_.store(true);
         std::lock_guard<std::mutex> lock(mutex_);
+        aborted_.store(true);
         produce_.notify_all();
         consume_.notify_all();
     }
-
     void finish() {
         writer_.flush();
         state_.generation_seconds = writer_.generation_seconds();
     }
-
 private:
-    void replay(GenChunk& chunk) {
-        size_t offset = 0;
-        for (const auto& op : chunk.ops) {
-            if (op.is_append) {
-                const uint8_t* source = nullptr;
-                int length = op.length;
-                if (length > 0 && length <= PW_MAX_LEN) {
-                    source = chunk.bytes.data() + offset;
-                    offset += static_cast<size_t>(length);
-                }
-                writer_.append(length, op.next, [&](uint8_t* out) {
-                    if (source) memcpy(out, source, static_cast<size_t>(length));
-                });
-            } else {
-                writer_.set_next(op.next);
-            }
-        }
+    void recycle(std::unique_ptr<GenChunk> chunk) {
+#ifndef MULTIBIT_DISABLE_CHUNK_POOL
+        std::lock_guard<std::mutex> lock(mutex_);
+        available_[chunk->owner()].push_back(std::move(chunk));
+        produce_.notify_all();
+#endif
     }
-
+    void replay(const GenChunk& chunk) {
+        if (chunk.has_prefix()) writer_.set_next(chunk.prefix());
+#ifdef MULTIBIT_SCALAR_CHUNK_MERGE
+        for (size_t i = 0; i < chunk.count(); ++i) {
+            if (!writer_.append(static_cast<int>(chunk.lengths()[i]),
+                    chunk.next()[i], [&](uint8_t* output) {
+                        memcpy(output, chunk.data() + i * chunk.stride(),
+                               chunk.lengths()[i]);
+                    })) return;
+        }
+#else
+        writer_.append_block(chunk.data(), chunk.lengths(), chunk.next(),
+                             chunk.count(), chunk.stride());
+#endif
+    }
     ProducerState& state_;
     BatchWriter writer_;
     std::mutex mutex_;
     std::condition_variable produce_, consume_;
-    std::map<std::pair<uint64_t, uint32_t>, GenChunk> buffered_;
+    std::map<std::pair<uint64_t, uint32_t>,
+             std::unique_ptr<GenChunk>> buffered_;
     uint64_t expected_unit_ = 0;
-    uint32_t expected_seq_ = 0;
+    uint32_t expected_sequence_ = 0;
     uint64_t num_units_;
     size_t buffered_candidates_ = 0;
     const size_t budget_ = 4 * static_cast<size_t>(BATCH_SIZE);
+    std::vector<std::vector<std::unique_ptr<GenChunk>>> available_;
+    std::vector<size_t> allocated_;
     std::atomic<bool> aborted_{false};
 };
 
-// Per-worker, per-unit sink: packs a unit's candidates (spanning many small
-// combinations) into bounded chunks. Mirrors BatchWriter's byte-storage guard
-// so replay is exact.
 class ChunkSink {
 public:
-    ChunkSink(ParallelMerge& merge, uint64_t unit)
-        : merge_(merge), unit_(unit) {
-        current_.unit = unit;
-        reserve();
-    }
+    ChunkSink(ParallelMerge& merge, uint64_t unit, size_t owner = 0)
+        : merge_(merge), unit_(unit), owner_(owner) { acquire(); }
     bool stopped() const { return merge_.stopped(); }
-
     template <class Write>
     bool append(int length, NextCandidate next, Write write) {
-        if (merge_.stopped()) return false;
-        if (length > 0 && length <= PW_MAX_LEN) {
-            size_t offset = current_.bytes.size();
-            current_.bytes.resize(offset + static_cast<size_t>(length));
-            write(current_.bytes.data() + offset);
+        if (stopped() || !current_) return false;
+        if (length == 0 || length > PW_MAX_LEN) return true;
+        // Defer publishing a full chunk until final metadata is available.
+        if (current_->count() == PARALLEL_CHUNK_CANDIDATES) {
+            flush(false);
+            if (!current_) return false;
         }
-        current_.ops.push_back({true, length, next});
-        ++current_.candidates;
-        if (current_.candidates >= PARALLEL_CHUNK_CANDIDATES) flush(false);
-        return !merge_.stopped();
+        current_->append(length, next, write);
+        return true;
     }
     void set_next(NextCandidate next) {
-        current_.ops.push_back({false, 0, next});
+        if (current_) current_->set_next(next);
     }
     void finish() { flush(true); }
-
 private:
-    void reserve() {
-        current_.ops.reserve(PARALLEL_CHUNK_CANDIDATES + PARALLEL_CHUNK_CANDIDATES / 4);
-        current_.bytes.reserve(PARALLEL_CHUNK_CANDIDATES * 16);
+    void acquire() {
+        current_ = merge_.acquire(owner_);
+        if (current_) current_->reset(unit_, sequence_);
     }
     void flush(bool last) {
-        uint32_t seq = current_.seq;
-        current_.last = last;
+        if (!current_) return;
+        current_->set_last(last);
         merge_.publish(std::move(current_));
-        current_ = GenChunk{};
-        current_.unit = unit_;
-        current_.seq = seq + 1;
-        reserve();
+        ++sequence_;
+        if (!last) acquire();
     }
     ParallelMerge& merge_;
     uint64_t unit_;
-    GenChunk current_;
+    size_t owner_;
+    uint32_t sequence_ = 0;
+    std::unique_ptr<GenChunk> current_;
 };
+
 
 static void generate_parallel(ProducerState& state, uint64_t base_count) {
     const auto& lines = *state.lines;
@@ -390,23 +524,25 @@ static void generate_parallel(ProducerState& state, uint64_t base_count) {
     const uint64_t start_combo = state.start_combo;
     const uint64_t total = state.total_combos;
     const uint64_t remaining = total > start_combo ? total - start_combo : 0;
+    const uint64_t unit_combos = state.typo_cfg && state.typo_cfg->any()
+        ? 1 : PARALLEL_UNIT_COMBOS;
     const uint64_t num_units =
-        (remaining + PARALLEL_UNIT_COMBOS - 1) / PARALLEL_UNIT_COMBOS;
+        (remaining + unit_combos - 1) / unit_combos;
     ParallelMerge merge(state, base_count, num_units);
     std::atomic<uint64_t> next_start{start_combo};
     std::exception_ptr worker_error;
     std::mutex error_mutex;
-    auto worker = [&]() {
+    auto worker = [&](size_t worker_index) {
         try {
             const char* free_tokens[MAX_FREE];
             int free_lengths[MAX_FREE], permutation[MAX_FREE];
             AnchorSlot anchors[MAX_ANCHORED];
             while (!merge.stopped()) {
-                uint64_t start = next_start.fetch_add(PARALLEL_UNIT_COMBOS);
+                uint64_t start = next_start.fetch_add(unit_combos);
                 if (start >= total) break;
-                uint64_t unit = (start - start_combo) / PARALLEL_UNIT_COMBOS;
-                uint64_t end = std::min(start + PARALLEL_UNIT_COMBOS, total);
-                ChunkSink sink(merge, unit);
+                uint64_t unit = (start - start_combo) / unit_combos;
+                uint64_t end = std::min(start + unit_combos, total);
+                ChunkSink sink(merge, unit, worker_index);
                 for (uint64_t combo = start; combo < end && !merge.stopped();
                      ++combo) {
                     int free_count = 0, anchor_count = 0;
@@ -436,7 +572,7 @@ static void generate_parallel(ProducerState& state, uint64_t base_count) {
     std::vector<std::thread> workers;
     try {
         for (int i = 0; i < state.producers; ++i) {
-            workers.emplace_back(worker);
+            workers.emplace_back(worker, static_cast<size_t>(i));
         }
         merge.run();
     } catch (...) {

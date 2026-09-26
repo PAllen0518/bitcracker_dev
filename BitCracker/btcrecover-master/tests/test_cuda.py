@@ -183,6 +183,14 @@ def test_streamed_typos_preserve_reference_order(flags, budget):
         "mixed_lengths",
         "md5",
         "parallel",
+        "block_merge",
+        "chunk_reuse",
+        "block_boundaries",
+        "raw_blocks",
+        "pool_ownership",
+        "pool_progress",
+        "pool_cancel",
+        "seeded_blocks",
     ],
 )
 def test_native_contract(name):

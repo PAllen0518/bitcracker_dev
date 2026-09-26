@@ -1207,10 +1207,19 @@ static int run_application(int argc, char** argv) {
     if (timings) {
         printf("TIMINGS {\"count\":%llu,\"generation_s\":%.9f,"
                "\"copy_ms\":%.6f,\"kernel_ms\":%.6f,\"wall_s\":%.9f,"
-               "\"transfer_bytes\":%llu,\"gpu_slots\":%d}\n",
-               static_cast<unsigned long long>(checked),
-               producer_state.generation_seconds, copy_ms, kernel_ms, elapsed,
-               static_cast<unsigned long long>(transferred), gpu.device_allocations());
+               "\"transfer_bytes\":%llu,\"gpu_slots\":%d,"
+               "\"merge_s\":%.9f,\"chunk_allocations\":%llu,"
+               "\"chunk_storage_bytes\":%llu,\"block_copies\":%llu}\n",
+                static_cast<unsigned long long>(checked),
+                producer_state.generation_seconds, copy_ms, kernel_ms, elapsed,
+                static_cast<unsigned long long>(transferred),
+                gpu.device_allocations(),
+                producer_state.merge_seconds,
+                static_cast<unsigned long long>(
+                    producer_state.chunk_allocations.load()),
+                static_cast<unsigned long long>(
+                    producer_state.chunk_storage_bytes.load()),
+                static_cast<unsigned long long>(producer_state.block_copies));
     }
     return 0;
 }

@@ -133,6 +133,11 @@ public:
     uint64_t start_combo = 0, start_perm = 0, start_typo = 0;
     uint64_t total_combos = 0;
     double generation_seconds = 0;
+    std::atomic<uint64_t> chunk_allocations{0};
+    uint64_t block_copies = 0;
+    std::atomic<uint64_t> chunk_storage_bytes{0};
+    std::atomic<uint64_t> chunk_live_bytes{0};
+    double merge_seconds = 0;
     int producers = 1;  // >1 enables the parallel generate + ordered merge
 
     explicit ProducerState(int capacity = BATCH_SIZE, bool pin = true) {
