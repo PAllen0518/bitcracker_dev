@@ -10,6 +10,9 @@ settings.json
 *.pyo
 /addresses.db
 claude.md
+# ...but CLAUDE.md is a tracked project instruction file. Keep it tracked,
+# especially on case-insensitive filesystems where "claude.md" would match it.
+!CLAUDE.md
 
 # Python tooling caches
 __pycache__/
@@ -39,9 +42,13 @@ savefile*
 # Internal engineering audit (not for publication yet)
 audit/
 
+# Shared agent-workspace runtime directory (coordination DB and runtime handoffs)
+.agent-workspace/
+
 # Recovered passwords, written to a file instead of stdout (never commit these)
 RECOVERED_PASSWORD.txt
 # CUDA Build Artifacts
+.cuda-build/
 *.exe
 *.bin
 *.obj
