@@ -263,6 +263,8 @@ public:
         : owner_(owner), state_(state), bytes_(PARALLEL_CHUNK_CANDIDATES * 32),
           lengths_(PARALLEL_CHUNK_CANDIDATES),
           next_(PARALLEL_CHUNK_CANDIDATES) {
+        // Three payload vectors (bytes, lengths, next) allocate per new chunk;
+        // this counter tracks pool growth, not every process allocation.
         state_.chunk_allocations.fetch_add(3);
         record_growth();
     }
@@ -285,6 +287,9 @@ public:
         stride_ = 32;
         has_prefix_ = false;
     }
+    // The next-candidate metadata trails the last appended candidate. Before the
+    // first append it belongs to the previous chunk's final slot, so carry it as
+    // a prefix and apply it there during replay.
     void set_next(NextCandidate next) noexcept {
         if (count_) next_[count_ - 1] = next;
         else {
@@ -327,6 +332,8 @@ private:
             state_.chunk_allocations.fetch_add(1);
             record_growth();
         }
+        // Restride existing candidates from the top down so an in-place move
+        // never overwrites a slot we have not copied yet.
         for (size_t i = count_; i > 0; --i) {
             memmove(bytes_.data() + (i - 1) * required,
                     bytes_.data() + (i - 1) * stride_, lengths_[i - 1]);
@@ -365,6 +372,9 @@ public:
         return std::make_unique<GenChunk>(owner, state_);
 #else
         std::unique_lock<std::mutex> lock(mutex_);
+        // Each owner keeps its own reservation of CHUNKS_PER_WORKER, so a burst
+        // of later units cannot consume the chunks the next in-order producer
+        // needs to keep making progress.
         produce_.wait(lock, [&] {
             return stopped() || !available_[owner].empty()
                 || allocated_[owner] < CHUNKS_PER_WORKER;
@@ -384,6 +394,8 @@ public:
     void publish(std::unique_ptr<GenChunk> chunk) {
         std::unique_lock<std::mutex> lock(mutex_);
         const auto position = chunk->position();
+        // Wait for buffer room, but always admit the chunk the merge is waiting
+        // for next -- even over budget -- so the earliest ordered work never deadlocks.
         produce_.wait(lock, [&] {
             return stopped()
                 || buffered_candidates_ + chunk->count() <= budget_
