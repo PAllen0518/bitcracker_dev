@@ -54,3 +54,9 @@ RECOVERED_PASSWORD.txt
 *.obj
 cl_intercept.log
 nvcc_*.txt
+# Checkpoint backups and GPU run logs, never commit
+*.bak
+*.bak-*
+search*.log
+# Session scratch
+Claude outputs/
