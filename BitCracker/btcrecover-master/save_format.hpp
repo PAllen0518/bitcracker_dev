@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <cstddef>    // offsetof
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +48,15 @@ struct SaveState {
 // Older saves ended after passwords_checked. They still restore at combo
 // precision; new saves include perm_idx and typo_idx for exact resumes.
 static const size_t OLD_SAVE_STATE_SIZE = 512 + 512 + sizeof(uint64_t) * 3;
+
+// Pin the legacy ABI at compile time: the migration reader depends on these
+// exact sizes and offsets to recover the real save's resume indices.
+static_assert(sizeof(SaveState) == 1064, "legacy SaveState must stay 1064 bytes");
+static_assert(offsetof(SaveState, combo_idx) == 1024, "combo_idx offset moved");
+static_assert(offsetof(SaveState, total_combos) == 1032, "total_combos offset moved");
+static_assert(offsetof(SaveState, passwords_checked) == 1040, "passwords_checked offset moved");
+static_assert(offsetof(SaveState, perm_idx) == 1048, "perm_idx offset moved");
+static_assert(offsetof(SaveState, typo_idx) == 1056, "typo_idx offset moved");
 
 static void save_progress(const char* path, const SaveState& s) {
     FILE* f=fopen(path,"wb");
@@ -254,6 +264,16 @@ struct SaveRecordV1 {
 static const size_t SAVE_RECORD_V1_SIZE = sizeof(SaveRecordV1);
 static const size_t SAVE_RECORD_V1_CHECKSUMMED = SAVE_RECORD_V1_SIZE - 32;
 
+// Pin the v1 ABI: the on-disk layout and progress offsets are a compatibility
+// contract, and tests decode them by fixed offset.
+static_assert(sizeof(SaveRecordV1) == 1216, "v1 record must stay 1216 bytes");
+static_assert(offsetof(SaveRecordV1, combo_idx) == 1144, "v1 combo_idx offset moved");
+static_assert(offsetof(SaveRecordV1, total_combos) == 1152, "v1 total_combos offset moved");
+static_assert(offsetof(SaveRecordV1, passwords_checked) == 1160, "v1 passwords_checked offset moved");
+static_assert(offsetof(SaveRecordV1, perm_idx) == 1168, "v1 perm_idx offset moved");
+static_assert(offsetof(SaveRecordV1, typo_idx) == 1176, "v1 typo_idx offset moved");
+static_assert(offsetof(SaveRecordV1, record_sha256) == 1184, "v1 checksum offset moved");
+
 static void finalize_record_checksum(SaveRecordV1& r) {
     sha256(reinterpret_cast<const uint8_t*>(&r), SAVE_RECORD_V1_CHECKSUMMED,
            r.record_sha256);
@@ -341,18 +361,43 @@ static SaveMismatch validate_save(
 // ---------------------------------------------------------------------------
 
 // Test-only seam to force a failure at a specific stage. Production passes None.
-enum class WriteFault { None, ShortWrite, FlushFail, RenameFail };
+enum class WriteFault {
+    None,
+    ShortWrite,
+    FlushFail,
+    CommitFail,
+    AttributeFail,
+    RenameFail
+};
 
-static bool file_exists(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
+enum class FileState { Present, Absent, Error };
+
+// Existence must be independent of whether the process can open the file.
+// Only Windows' explicit not-found results mean Absent. Access, device, and
+// other I/O failures are Error so callers can fail closed.
+static FileState file_state(const char* path, DWORD* attributes = nullptr,
+                            bool force_error = false) {
+    if (force_error) return FileState::Error;
+    SetLastError(ERROR_SUCCESS);
+    const DWORD found = GetFileAttributesA(path);
+    if (found != INVALID_FILE_ATTRIBUTES) {
+        if (attributes) *attributes = found;
+        return FileState::Present;
+    }
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+        return FileState::Absent;
+    }
+    return FileState::Error;
 }
 
 // Durable copy via a temp file + atomic rename, so the destination is never
-// left partial. Used to retain the previous save generation.
-static bool copy_file_durable(const char* src, const char* dst) {
+// left partial. Used to retain the previous generation (.prev) and the legacy
+// backup (.legacy). Reports success only after the bytes are flushed, fsync'd,
+// and durably renamed into place; every return code is checked. The WriteFault
+// seam forces a failure at a given stage for tests.
+static bool copy_file_durable(const char* src, const char* dst,
+                              WriteFault fault = WriteFault::None) {
     FILE* in = fopen(src, "rb");
     if (!in) return false;
     std::string tmp = std::string(dst) + ".tmp";
@@ -366,9 +411,23 @@ static bool copy_file_durable(const char* src, const char* dst) {
     }
     if (ferror(in)) ok = false;
     fclose(in);
-    if (ok) { fflush(out); _commit(_fileno(out)); }
+    // Durably flush before trusting the copy: a backup that is not on stable
+    // storage must not report success.
+    if (ok && (fflush(out) != 0 || fault == WriteFault::FlushFail)) {
+        ok = false;
+    }
+    if (ok && (fault == WriteFault::CommitFail
+               || _commit(_fileno(out)) != 0)) {
+        ok = false;
+    }
     if (fclose(out) != 0) ok = false;
-    if (ok) ok = MoveFileExA(tmp.c_str(), dst, MOVEFILE_REPLACE_EXISTING) != 0;
+    // Durable, atomic publish. A backup counts as made only once the rename
+    // itself is write-through.
+    if (ok && (fault == WriteFault::RenameFail
+               || MoveFileExA(tmp.c_str(), dst,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0)) {
+        ok = false;
+    }
     if (!ok) remove(tmp.c_str());
     return ok;
 }
@@ -389,21 +448,56 @@ static bool save_bytes_v1(const char* path, const uint8_t* data, size_t size,
     size_t wrote = fwrite(data, 1, intended, f);
     if (wrote != size) { fclose(f); remove(tmp.c_str()); return false; }
     // Stage 2: flush to stable storage.
-    if (fflush(f) != 0 || fault == WriteFault::FlushFail
-        || _commit(_fileno(f)) != 0) {
+    if (fflush(f) != 0 || fault == WriteFault::FlushFail) {
+        fclose(f); remove(tmp.c_str()); return false;
+    }
+    if (fault == WriteFault::CommitFail || _commit(_fileno(f)) != 0) {
         fclose(f); remove(tmp.c_str()); return false;
     }
     if (fclose(f) != 0) { remove(tmp.c_str()); return false; }
-    // Stage 3: retain the prior generation before replacing (best effort; a
-    // failure to make .prev must not block the primary save from advancing).
-    if (file_exists(path)) {
-        copy_file_durable(path, (std::string(path) + ".prev").c_str());
+    // Stage 3: stage the prior generation separately. Do not publish .prev
+    // until the new primary commits, otherwise a failed primary rename would
+    // overwrite the older recovery generation. Attribute errors fail closed.
+    const FileState prior_state = file_state(
+        path, nullptr, fault == WriteFault::AttributeFail);
+    if (prior_state == FileState::Error) {
+        remove(tmp.c_str());
+        return false;
     }
-    // Stage 4: atomic replace. On failure the original <path> is untouched.
+    const bool has_prior = prior_state == FileState::Present;
+    const std::string prev = std::string(path) + ".prev";
+    const std::string prev_tmp = std::string(path) + ".prevtmp";
+    if (has_prior) {
+        DWORD prev_attributes = 0;
+        const FileState prev_state = file_state(prev.c_str(), &prev_attributes);
+        if (prev_state == FileState::Error
+            || (prev_state == FileState::Present
+                && (prev_attributes & (FILE_ATTRIBUTE_DIRECTORY
+                                       | FILE_ATTRIBUTE_READONLY)) != 0)) {
+            remove(tmp.c_str());
+            return false;
+        }
+        if (!copy_file_durable(path, prev_tmp.c_str())) {
+            remove(tmp.c_str());
+            remove(prev_tmp.c_str());
+            return false;
+        }
+    }
+    // Stage 4: commit the new primary first. A failure leaves both the current
+    // primary and the published .prev byte-for-byte unchanged.
     if (fault == WriteFault::RenameFail
         || MoveFileExA(tmp.c_str(), path,
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
         remove(tmp.c_str());
+        remove(prev_tmp.c_str());
+        return false;
+    }
+    // Stage 5: only after the primary commits, publish its prior generation.
+    // Preflight above rejects known-unpublishable targets before advancement.
+    if (has_prior
+        && MoveFileExA(prev_tmp.c_str(), prev.c_str(),
+                       MOVEFILE_REPLACE_EXISTING
+                           | MOVEFILE_WRITE_THROUGH) == 0) {
         return false;
     }
     return true;
@@ -415,11 +509,16 @@ static bool save_record_v1(const char* path, const SaveRecordV1& r,
                          sizeof(r), fault);
 }
 
-// Load a v1 record: exact size, magic, and checksum. On success `out` holds the
+// Load a v1 record: the file must be EXACTLY one record long (trailing bytes are
+// corruption and are rejected), with the right magic. On success `out` holds the
 // parsed record; callers still run validate_save against current inputs.
 static bool load_record_v1(const char* path, SaveRecordV1& out) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long size = ftell(f);
+    if (size != static_cast<long>(sizeof(out))) { fclose(f); return false; }
+    rewind(f);
     memset(&out, 0, sizeof(out));
     size_t n = fread(&out, 1, sizeof(out), f);
     fclose(f);
@@ -443,7 +542,7 @@ static SaveKind detect_save_kind(const char* path) {
     long size = ftell(f);
     fclose(f);
     if (got == 8 && memcmp(head, SAVE_MAGIC_V1, 8) == 0
-        && size >= static_cast<long>(SAVE_RECORD_V1_SIZE)) {
+        && size == static_cast<long>(SAVE_RECORD_V1_SIZE)) {
         return SaveKind::V1;
     }
     if (size == static_cast<long>(sizeof(SaveState)))     return SaveKind::Legacy1064;

@@ -1,6 +1,6 @@
 # Checkpoint / save integrity spec
 
-Status: **draft — awaiting Paul's approval (gate 1). No code until approved.**
+Status: **approved by Paul, gate 1 cleared.**
 
 Scope: `BitCracker/btcrecover-master/multibit_cuda_threads.cu` save/restore.
 Base commit: `a01d2b6` (`docs(cuda): explain parallel-generation chunk pool and merge invariants`).
@@ -186,21 +186,23 @@ rename, all return codes inspected:
 3. Flush to stable storage: `fflush`, then `_commit(_fileno(f))` (the Windows
    `fsync` equivalent) / `FlushFileBuffers`. Check the return.
 4. `fclose`, checked.
-5. **Retain the prior generation on every save:** if `<path>` exists, atomically
-   rename it to `<path>.prev` (`MOVEFILE_REPLACE_EXISTING`, replacing any older
-   `.prev`). This keeps one known-good previous save at all times.
+5. Query `<path>` and `<path>.prev` with tri-state attribute checks. Any
+   attribute error fails closed. If `<path>` exists, reject a known-
+   unpublishable `.prev` target, then durably stage `<path>` to
+   `<path>.prevtmp` without changing the published `.prev`.
 6. Atomically move the new file into place: `MoveFileExW(tmp, path,
    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (or `ReplaceFileW`). Check
    the return.
-7. On any failure: leave the previous good save (and `.prev`) intact, emit a loud
+7. Only after step 6 succeeds, publish `<path>.prevtmp` to `<path>.prev` with a
+   write-through atomic rename. This retains the immediately prior generation.
+8. On any failure before the primary rename: leave the previous good save and
+   `.prev` byte-for-byte intact, emit a loud
    warning, and — for the periodic autosave — keep the search running (a transient
    autosave failure must not kill a long run; it must not silently succeed either).
 
-The temp file is per-target and cleaned up on failure. The brief window between
-steps 5 and 6 where `<path>` is momentarily absent is covered by `<path>.prev`
-holding the last good save, so a crash there is still recoverable. On success the
-primary path ends up with a valid save (as today) plus a retained prior generation,
-and the write is crash-safe.
+The temp files are per-target and cleaned up on pre-commit failure. A failed
+primary rename cannot advance either published generation. On success the primary
+path contains the new save and `.prev` contains the immediately prior save.
 
 ---
 
@@ -227,6 +229,10 @@ pattern. Tests are added to that harness and to `tests/test_cuda.py`.
 | `restore_detects_corruption` | Any single-byte flip / truncation refuses via checksum. | Today accepts. |
 | `save_is_atomic_and_durable` | Injected short-write / flush-fail / rename-fail leaves prior save intact; success replaces atomically. | Today: no temp/flush/rename/return checks. |
 | `save_retains_prev_generation` | After two successful saves, `<path>.prev` holds the immediately-prior valid record. | No `.prev` rotation today. |
+| `save_three_generation_rename_failure` | With generation 2 primary and generation 1 `.prev`, injected primary rename failure leaves both byte-for-byte unchanged. | The pre-fix writer advances `.prev` before the primary commits. |
+| `save_file_state_error` | Attribute-query error is distinct from absence and refuses to advance the save. | Binary `file_exists()` treats open errors as absence. |
+| `save_commit_failure` | Distinct `_commit` failures in backup and primary paths report failure without changing published files. | Flush injection short-circuits before `_commit`. |
+| `save_fuzz` | 32 seeded random records round-trip; flipping each byte position individually makes checksum verification fail. | Property contract absent. |
 | `legacy_1064_migration_preserves_indices` | Synthetic 1064-byte blob → exact indices; resume matches. | Migration reader absent. |
 | `legacy_1048_migration` | Older 1048-byte blob → first three fields exact, perm/typo=0. | Absent. |
 | `legacy_rebind_requires_confirmation` | Legacy restore refuses on wrong/absent/EOF stdin input; only the exact typed token (`REBIND`) proceeds, then resumes at identical indices and writes valid v1. | Absent. |

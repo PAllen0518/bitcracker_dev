@@ -1,5 +1,6 @@
 """Exercise recovery and persisted state through the real executable."""
 
+import base64
 import hashlib
 import json
 import os
@@ -290,3 +291,68 @@ def test_cli_legacy_requires_confirmation_then_migrates(tmp_path):
     assert ok.returncode == 0, ok.stderr
     assert checkpoint.read_bytes()[:8] == V1_MAGIC
     assert (tmp_path / "legacy.bin.legacy").read_bytes() == original
+
+
+def test_cli_migration_aborts_when_backup_fails(tmp_path):
+    # Defect 1: if the .legacy backup cannot be made durably, migration must
+    # abort and leave the only legacy checkpoint byte-for-byte intact.
+    token_file = tmp_path / "synthetic.txt"
+    token_file.write_text("+ab cd\n+ef\n", encoding="utf-8")
+    checkpoint = tmp_path / "legacy.bin"
+    _make_legacy_save(checkpoint, token_file, WALLET, 0, 2, 0)
+    original = checkpoint.read_bytes()
+    # Occupy the .legacy destination with a directory so the durable copy fails.
+    (tmp_path / "legacy.bin.legacy").mkdir()
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3", stdin="REBIND\n")
+    assert result.returncode != 0
+    assert checkpoint.read_bytes() == original          # not overwritten
+    assert checkpoint.read_bytes()[:8] != V1_MAGIC      # not migrated
+
+
+def _write_wallet(path, salt, enc):
+    """Write a valid MultiBit key file (base64 of Salted__ + salt + enc)."""
+    path.write_text(
+        base64.b64encode(b"Salted__" + salt + enc).decode(), encoding="ascii"
+    )
+
+
+def test_cli_restore_refuses_wrong_wallet(tmp_path):
+    # Defect 6: end-to-end wallet-binding rejection.
+    checkpoint = _autosaved_search(tmp_path)  # bound to the public WALLET
+    other = tmp_path / "other-wallet.key"
+    _write_wallet(other, b"OTHERSLT", bytes(range(32)))
+    result = _restore(tmp_path, checkpoint, "--wallet", str(other),
+                      "--batch-size", "3")
+    assert result.returncode != 0
+    assert "wallet" in result.stderr.lower()
+    assert not (tmp_path / "RECOVERED_PASSWORD.txt").exists()
+
+
+def test_cli_restore_refuses_wrong_typos(tmp_path):
+    # Defect 6: end-to-end typo-option binding rejection.
+    checkpoint = tmp_path / "synthetic.bin"
+    token_file = tmp_path / "synthetic.txt"
+    token_file.write_text("+ab\n", encoding="utf-8")
+    first = subprocess.run(
+        [str(APP), "--wallet", str(WALLET), "--tokenlist", str(token_file),
+         "--autosave", str(checkpoint), "--batch-size", "3",
+         "--typos", "1", "--typos-repeat"],
+        cwd=tmp_path, capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert first.returncode == 0, first.stderr
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3",
+                      "--typos", "1", "--typos-swap")
+    assert result.returncode != 0
+    assert "typo" in result.stderr.lower()
+
+
+def test_cli_found_password_not_printed_when_file_uncreatable(tmp_path):
+    # Defect 7: if the protected output file cannot be created, the recovered
+    # password must never appear on stdout or stderr.
+    (tmp_path / "RECOVERED_PASSWORD.txt").mkdir()  # occupy the output path
+    result = run_app(
+        tmp_path, "+wrong1 btcr-test-password wrong2\n", "--batch-size", "3",
+    )
+    combined = result.stdout + result.stderr
+    assert "btcr-test-password" not in combined
+    assert "PASSWORD FOUND: '" not in result.stdout

@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 #include <cuda_runtime.h>
 #include <io.h>
 #include <fcntl.h>
@@ -922,10 +923,16 @@ static void write_found_password(const uint8_t* pw, int len) {
     int fd = _open(path, _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY,
                     _S_IREAD | _S_IWRITE);
     if (fd < 0) {
-        fprintf(stderr, "\nWARNING: could not create %s; printing password below instead.\n", path);
-        printf("\n*** PASSWORD FOUND: '");
-        fwrite(pw, 1, len, stdout);
-        printf("' ***\n");
+        // The password was found but its restricted file cannot be created.
+        // Never fall back to stdout or any log: emit an error WITHOUT the
+        // password so the secret cannot leak into scrollback or redirected
+        // output. The user fixes the file/permission problem and re-runs.
+        (void)pw; (void)len;
+        fprintf(stderr,
+            "\n*** PASSWORD FOUND but %s could not be created (errno %d). ***\n"
+            "The password was deliberately NOT printed and NOT written anywhere.\n"
+            "Fix the file/permission problem and re-run to recover it.\n",
+            path, errno);
         return;
     }
     _write(fd, pw, len);
@@ -1172,9 +1179,18 @@ static int run_application(int argc, char** argv) {
             return 1;
         }
         // Preserve the original legacy bytes before the first v1 write replaces
-        // them, so a mistaken re-bind can still be recovered.
-        copy_file_durable(restore_path,
-                          (std::string(restore_path) + ".legacy").c_str());
+        // them. This backup is mandatory: if it cannot be made durably, abort
+        // fail-loud and leave the only legacy checkpoint byte-for-byte intact
+        // rather than risk it.
+        if (!copy_file_durable(restore_path,
+                               (std::string(restore_path) + ".legacy").c_str())) {
+            fprintf(stderr,
+                "\nFATAL: could not durably back up the legacy save to %s.legacy.\n"
+                "Refusing to migrate so the original checkpoint is not put at risk.\n"
+                "Free up space / fix permissions for that path and re-run.\n",
+                restore_path);
+            return 1;
+        }
         printf("Re-bind confirmed; the next save will be written in v1 format.\n");
     }
 
