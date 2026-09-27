@@ -1,6 +1,10 @@
 # Claude and Codex shared workspace specification
 
-Status: awaiting user approval before implementation or test-code changes.
+Status: approved by Paul on 2026-09-27, Gate 1 cleared.
+
+Approved contract hash: LF-normalized SHA-256
+`7e2a99cce0b4f1357deaddb8c2e80274c65be909a238d56f71f6d1d5a177c627`.
+Implementation baseline: `751ebd309348751959bc456c5f32cda93a239230`.
 
 ## Goal
 
