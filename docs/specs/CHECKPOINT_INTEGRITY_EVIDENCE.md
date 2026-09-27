@@ -1,7 +1,8 @@
 # Checkpoint / save integrity — evidence
 
-Status: **corrective round 2 complete; fuzz and mutation layers now pass.
-Awaiting Codex re-review. Gate 5 remains blocked.**
+Status: **complete on master at `7d00d84`. Codex re-review and independent
+cross-agent verification are complete. Gate 5 was approved by Paul on
+2026-09-26, and Gate 7 was cleared through PR #1.**
 
 Contract: [approved spec](CHECKPOINT_INTEGRITY_SPEC.md) (gate 1 cleared).
 Base commit: `a01d2b6`. Worktree: `claude/checkpoint-integrity-spec`.
@@ -112,7 +113,11 @@ save_sha256 .. save_rebind_roundtrip : 14/14 PASS
   single main-loop thread; producer threads never touch it), so this is a
   coverage gap, not a known race.
 - No CUDA memcheck: this change is host-only; no kernel or device buffer changed.
-- No independent verifier. No staging, commit, push, or attribution changes.
+- Independent verification was not part of this initial implementation round.
+  Codex later completed re-review, and Claude independently verified the exact
+  final corrective state in
+  [handoff 06](../handoffs/2026-09-26-06-claude.md). No staging, commit, push,
+  or attribution changes occurred during this initial round.
 - The migration path was proven on synthetic 1064/1048 fixtures only. Migrating
   the real Search60 save is a deliberate, user-run, interactively-confirmed step.
 
@@ -177,16 +182,19 @@ assert `validate_save` returns a non-`None` mismatch, so they would also have
 failed against the RED accept-all stub; `save_detect_unknown` covers a defensive
 branch of the (already-real) `detect_save_kind`.
 
-- [ ] Public-fixture & coverage validation sign-off (COLLABORATION.md gate 5).
-- [ ] User-owned commit + push (gate 7). Suggested commit set and message are in
-      the handoff `docs/handoffs/2026-09-26-02-claude.md`.
+- [x] Public-fixture and coverage validation sign-off (gate 5), approved by
+      Paul on 2026-09-26.
+- [x] Integration and Git commands (gate 7), cleared when Paul merged PR #1 to
+      master at `7d00d84` on 2026-09-26.
 
 ---
 
 # Corrective round — Codex review 2026-09-26-03 (defects 1–7)
 
-Status: **fixes applied and verified in worktree `claude/checkpoint-integrity-fixes`
-off master `740f8b0`. Awaiting Codex re-review, then Paul's gate 5 + commit.**
+Historical round status: **fixes applied and verified in worktree
+`claude/checkpoint-integrity-fixes` off master `740f8b0`. The later Codex
+re-review, independent cross-agent verification, Gate 5 approval, and PR #1
+merge are recorded below.**
 
 All work in an isolated worktree this round (Codex finding 8). No Git mutation,
 no recovery artifact touched, synthetic 1064/1048 fixtures only. RED was captured
@@ -265,8 +273,9 @@ not): each hash is over the file with `\r\n` collapsed to `\n`.
 
 # Corrective round 2, Codex findings F1 to F5
 
-Status: **implementation and required gauntlet layers pass. Awaiting Codex
-re-review, then Paul's gate 5 decision.**
+Status: **implementation and required gauntlet layers passed. Codex re-review
+and Claude's independent cross-agent verification are complete, as recorded in
+[handoff 06](../handoffs/2026-09-26-06-claude.md).**
 
 Approved-spec record: gate 1 was cleared against hash prefix `4e742c73`.
 Paul's F1 to F5 instruction is the approved corrective amendment. The spec now
@@ -276,8 +285,10 @@ LF-normalized SHA-256 is
 
 All work stayed in `claude/checkpoint-integrity-fixes` off `740f8b0`. No Git
 operation ran. Tests used synthetic data or the existing public fixture. No
-recovery artifact was read, copied, or modified. All build, pytest, fuzz, and
-mutation artifacts are under `BitCracker/btcrecover-master/.cuda-build`.
+recovery artifact was read, copied, or modified. Build, pytest, fuzz, and
+mutation artifacts were written under the worktree's ignored
+`BitCracker/btcrecover-master/.cuda-build`. That worktree was later removed, so
+the round-2 mutation reports and logs are not in this repository.
 
 ## RED by finding
 
@@ -356,7 +367,7 @@ built with exit 0, its test passed with exit 0, the driver reported
 `survived`, and exact source restoration was `True`. This proves the driver
 does not report a survivor as killed.
 
-Artifact:
+Historical artifact location in the removed worktree:
 `.cuda-build/save-format-mutation/mutation-negative-control.json`.
 
 ### Required mutation run
@@ -376,10 +387,18 @@ targeted test failed with exit 1. Every exact source restoration was `True`.
 | Weaken exact-size check | `save_reject_oversized` | killed |
 | Drop migration backup abort | `test_cli_migration_aborts_when_backup_fails` | killed |
 
-Artifacts: `.cuda-build/save-format-mutation/mutation-report.json`, plus one
-build log and one pytest log per mutant. The driver fails closed on a missing
-or duplicate source match, build failure, surviving mutant, or failed exact
-source restoration. Build failures do not count as kills.
+Historical artifacts in the removed worktree:
+`.cuda-build/save-format-mutation/mutation-report.json`, plus one build log and
+one pytest log per mutant. These ignored files were not committed. The driver
+fails closed on a missing or duplicate source match, build failure, surviving
+mutant, or failed exact source restoration. Build failures do not count as
+kills.
+
+The reports are reproducible from the repository. Run
+`python tools/validate_save_format.py` for the required mutation check, which
+must exit 0 with **5/5 killed**. Run
+`python tools/validate_save_format.py --negative-control` for the fail-path
+check, which must exit **1**. Do not commit `.cuda-build` contents.
 
 ### Restored-source builds
 
@@ -448,8 +467,9 @@ Claude's independent verification. Neither loses a generation:
   instrumented coverage.
 - ASan, UBSan, TSan, and host race detection remain unavailable here. No
   substitute is claimed.
-- Independent verification is not performed against this final state. Codex
-  re-review is the next required step.
-- Gate 5 remains blocked until Paul reviews the public-fixture, coverage, fuzz,
-  mutation, and corrective evidence.
-- Gate 7 remains blocked. Paul alone stages, commits, and pushes.
+- Codex re-review and Claude's independent cross-agent verification are
+  complete for this final state. Handoff 06 records 152 passed, 5/5 mutants
+  killed, no compiler warnings, and matching final source hashes.
+- Gate 5 was approved by Paul on 2026-09-26.
+- Gate 7 was cleared when PR #1 placed the corrective files on master at
+  `7d00d84`. Paul remains the only person who stages, commits, and pushes.
