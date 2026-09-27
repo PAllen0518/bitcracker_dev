@@ -2,6 +2,7 @@
 #pragma once
 #include <set>
 #include <future>
+#include <random>
 
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -826,6 +827,120 @@ static void save_prev_contract() {
             "previous generation was not retained");
 }
 
+static std::string save_slurp(const char* path);
+
+// F1: with three generations present, a failed primary publish must leave both
+// the current and previous generations byte-for-byte unchanged.
+static void save_three_generation_rename_failure_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 gen1, gen2, gen3;
+    build_record_v1(gen1, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    build_record_v1(gen2, "t", "w", ' ', th, wh, yh, 2, 100, 2, 0, 0);
+    build_record_v1(gen3, "t", "w", ' ', th, wh, yh, 3, 100, 3, 0, 0);
+    const char* path = ".cuda-build/save-three-generation.bin";
+    const std::string prev = std::string(path) + ".prev";
+    remove(path);
+    remove(prev.c_str());
+    require(save_record_v1(path, gen1), "generation 1 save failed");
+    require(save_record_v1(path, gen2), "generation 2 save failed");
+    const std::string primary_before = save_slurp(path);
+    const std::string prev_before = save_slurp(prev.c_str());
+    require(!save_record_v1(path, gen3, WriteFault::RenameFail),
+            "injected primary rename failure reported success");
+    require(save_slurp(path) == primary_before,
+            "primary changed after its rename failed");
+    require(save_slurp(prev.c_str()) == prev_before,
+            ".prev changed before the primary rename committed");
+}
+
+static void save_file_state_error_contract() {
+    const char* path = ".cuda-build/save-file-state.bin";
+    const std::string prev = std::string(path) + ".prev";
+    remove(path);
+    remove(prev.c_str());
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 gen1, gen2;
+    build_record_v1(gen1, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    build_record_v1(gen2, "t", "w", ' ', th, wh, yh, 2, 100, 2, 0, 0);
+    require(file_state(path) == FileState::Absent,
+            "missing path was not classified absent");
+    require(file_state(path, nullptr, true) == FileState::Error,
+            "attribute failure was classified absent");
+    require(save_record_v1(path, gen1), "initial state save failed");
+    const std::string before = save_slurp(path);
+    require(!save_record_v1(path, gen2, WriteFault::AttributeFail),
+            "save advanced after an existence-query error");
+    require(save_slurp(path) == before,
+            "primary changed after an existence-query error");
+    require(file_state(prev.c_str()) == FileState::Absent,
+            ".prev was created after an existence-query error");
+}
+
+static void save_commit_failure_contract() {
+    const char* src = ".cuda-build/save-commit-src.bin";
+    const char* dst = ".cuda-build/save-commit-dst.bin";
+    { std::ofstream f(src, std::ios::binary | std::ios::trunc); f << "new"; }
+    { std::ofstream f(dst, std::ios::binary | std::ios::trunc); f << "old"; }
+    require(!copy_file_durable(src, dst, WriteFault::CommitFail),
+            "backup reported success after injected _commit failure");
+    require(save_slurp(dst) == "old",
+            "backup destination changed after _commit failure");
+
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 gen1, gen2;
+    build_record_v1(gen1, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    build_record_v1(gen2, "t", "w", ' ', th, wh, yh, 2, 100, 2, 0, 0);
+    const char* path = ".cuda-build/save-commit.bin";
+    const std::string prev = std::string(path) + ".prev";
+    remove(path);
+    remove(prev.c_str());
+    require(save_record_v1(path, gen1), "initial commit save failed");
+    const std::string before = save_slurp(path);
+    require(!save_record_v1(path, gen2, WriteFault::CommitFail),
+            "save reported success after injected _commit failure");
+    require(save_slurp(path) == before,
+            "primary changed after injected _commit failure");
+    require(file_state(prev.c_str()) == FileState::Absent,
+            ".prev changed after injected _commit failure");
+}
+
+static void save_fuzz_contract() {
+    std::mt19937_64 generator(20260926);
+    const char* path = ".cuda-build/save-fuzz-roundtrip.bin";
+    remove(path);
+    remove((std::string(path) + ".prev").c_str());
+    for (int example = 0; example < 32; ++example) {
+        uint8_t th[32], wh[32], yh[32];
+        for (size_t index = 0; index < 32; ++index) {
+            th[index] = static_cast<uint8_t>(generator());
+            wh[index] = static_cast<uint8_t>(generator());
+            yh[index] = static_cast<uint8_t>(generator());
+        }
+        SaveRecordV1 original;
+        build_record_v1(
+            original, "synthetic-token-list", "synthetic-wallet",
+            static_cast<uint8_t>(generator()), th, wh, yh,
+            generator(), generator(), generator(), generator(), generator());
+        require(save_record_v1(path, original),
+                "random valid record could not be saved");
+        SaveRecordV1 loaded;
+        require(load_record_v1(path, loaded),
+                "random valid record could not be loaded");
+        require(memcmp(&loaded, &original, sizeof(original)) == 0,
+                "random valid record changed during round-trip");
+        for (size_t offset = 0; offset < sizeof(original); ++offset) {
+            SaveRecordV1 mutated = original;
+            auto* bytes = reinterpret_cast<uint8_t*>(&mutated);
+            bytes[offset] ^= 0x01;
+            require(!verify_record_checksum(mutated),
+                    "single-byte mutation passed checksum verification");
+        }
+    }
+}
+
 static void save_migrate_1064_contract() {
     SaveState s{};
     s.combo_idx = 123; s.total_combos = 1000; s.passwords_checked = 456;
@@ -937,6 +1052,112 @@ static void save_rebind_roundtrip_contract() {
             "rebind lost the resume indices");
 }
 
+static std::string save_slurp(const char* path) {
+    std::string out;
+    FILE* f = fopen(path, "rb");
+    if (!f) return out;
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+static void put_u64_le(std::vector<uint8_t>& b, size_t off, uint64_t v) {
+    for (int i = 0; i < 8; ++i) b[off + i] = static_cast<uint8_t>(v >> (i * 8));
+}
+
+// Defect 4: a v1 file with valid content plus trailing bytes must be rejected.
+static void save_reject_oversized_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    const char* path = ".cuda-build/save-oversized.bin";
+    require(save_record_v1(path, r), "base save failed");
+    { std::ofstream f(path, std::ios::binary | std::ios::app); f << "TRAILING"; }
+    require(detect_save_kind(path) != SaveKind::V1,
+            "oversized magic-prefixed file still detected as v1");
+    SaveRecordV1 got;
+    require(!load_record_v1(path, got),
+            "v1 record with trailing bytes was accepted");
+}
+
+// Defect 3: if the prior generation cannot be retained, the primary save must
+// NOT advance. The .prev path is occupied by a directory so the durable copy
+// cannot publish there.
+static void save_prev_failure_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 a, b;
+    build_record_v1(a, "t", "w", ' ', th, wh, yh, 1, 100, 1, 0, 0);
+    build_record_v1(b, "t", "w", ' ', th, wh, yh, 2, 100, 2, 0, 0);
+    const char* path = ".cuda-build/save-prevfail.bin";
+    std::string prev = std::string(path) + ".prev";
+    remove(path); remove(prev.c_str()); RemoveDirectoryA(prev.c_str());
+    require(save_record_v1(path, a), "initial save failed");
+    require(CreateDirectoryA(prev.c_str(), nullptr) != 0,
+            "could not occupy the .prev path with a directory");
+    require(!save_record_v1(path, b),
+            "save advanced despite a .prev retention failure");
+    SaveRecordV1 got;
+    require(load_record_v1(path, got) && got.combo_idx == 1,
+            "primary was overwritten when .prev retention failed");
+    RemoveDirectoryA(prev.c_str());
+    require(save_record_v1(path, b), "save failed after .prev path cleared");
+    require(load_record_v1(path, got) && got.combo_idx == 2,
+            "save did not advance once .prev could be retained");
+}
+
+// Defect 2: a backup reports success only after a durable flush and rename;
+// injected flush/rename failures must be reported and must not touch the dst.
+static void save_backup_durable_contract() {
+    const char* src = ".cuda-build/save-bk-src.bin";
+    const char* dst = ".cuda-build/save-bk-dst.bin";
+    { std::ofstream f(src, std::ios::binary | std::ios::trunc); f << "NEWCONTENT"; }
+    { std::ofstream f(dst, std::ios::binary | std::ios::trunc); f << "OLDCONTENT"; }
+    remove((std::string(dst) + ".tmp").c_str());
+    require(!copy_file_durable(src, dst, WriteFault::FlushFail),
+            "backup reported success despite a flush failure");
+    require(save_slurp(dst) == "OLDCONTENT", "dst changed after a flush failure");
+    require(!copy_file_durable(src, dst, WriteFault::RenameFail),
+            "backup reported success despite a rename failure");
+    require(save_slurp(dst) == "OLDCONTENT", "dst changed after a rename failure");
+    require(file_state((std::string(dst) + ".tmp").c_str())
+                == FileState::Absent,
+            "backup left a temp file behind on failure");
+    require(copy_file_durable(src, dst), "clean backup failed");
+    require(save_slurp(dst) == "NEWCONTENT",
+            "clean backup did not publish the new content");
+}
+
+// Defect 5: build the legacy fixture from an explicit documented byte layout
+// (not the native struct) with distinct nonzero indices matching the real
+// save's shape, and prove the reader returns them exactly.
+static void save_migrate_1064_raw_contract() {
+    std::vector<uint8_t> raw(1064, 0);
+    const uint64_t combo = 111222333444ull, total = 555666777888ull,
+                   checked = 999888777ull, perm = 41ull, typo = 17ull;
+    put_u64_le(raw, 1024, combo);
+    put_u64_le(raw, 1032, total);
+    put_u64_le(raw, 1040, checked);
+    put_u64_le(raw, 1048, perm);
+    put_u64_le(raw, 1056, typo);
+    const char* path = ".cuda-build/save-legacy-raw.bin";
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(raw.data()),
+                static_cast<std::streamsize>(raw.size()));
+    }
+    require(detect_save_kind(path) == SaveKind::Legacy1064,
+            "raw 1064 fixture not detected as legacy");
+    SaveState s{};
+    require(load_progress(path, s), "raw legacy load failed");
+    require(s.combo_idx == combo && s.total_combos == total
+            && s.passwords_checked == checked && s.perm_idx == perm
+            && s.typo_idx == typo,
+            "reader misread the documented legacy offsets (ABI mismatch)");
+}
+
 static int run_host_contract(const std::string& name) {
     if (name == "assembly") assembly_contract();
     else if (name == "resume") resume_contract();
@@ -967,8 +1188,19 @@ static int run_host_contract(const std::string& name) {
     else if (name == "save_reject_badversion") save_reject_badversion_contract();
     else if (name == "save_reject_combocount") save_reject_combocount_contract();
     else if (name == "save_detect_unknown") save_detect_unknown_contract();
+    else if (name == "save_reject_oversized") save_reject_oversized_contract();
+    else if (name == "save_prev_failure") save_prev_failure_contract();
+    else if (name == "save_backup_durable") save_backup_durable_contract();
+    else if (name == "save_migrate_1064_raw") save_migrate_1064_raw_contract();
     else if (name == "save_atomic") save_atomic_contract();
     else if (name == "save_prev") save_prev_contract();
+    else if (name == "save_three_generation_rename_failure")
+        save_three_generation_rename_failure_contract();
+    else if (name == "save_file_state_error")
+        save_file_state_error_contract();
+    else if (name == "save_commit_failure")
+        save_commit_failure_contract();
+    else if (name == "save_fuzz") save_fuzz_contract();
     else if (name == "save_migrate_1064") save_migrate_1064_contract();
     else if (name == "save_migrate_1048") save_migrate_1048_contract();
     else if (name == "save_rebind_confirm") save_rebind_confirm_contract();
