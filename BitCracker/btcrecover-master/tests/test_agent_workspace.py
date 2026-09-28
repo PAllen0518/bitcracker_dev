@@ -24,6 +24,7 @@ from tools.agent_workspace import (
 )
 from tools.agent_workspace_mcp import (
     ALLOWED_TOOL_NAMES,
+    MAX_RESPONSE_BYTES,
     McpRequestError,
     McpResponseTooLarge,
     dispatch_tool,
@@ -204,6 +205,38 @@ def run_stdio_client(project_root, database_path, requests):
     }
     assert {response["id"] for response in responses} == expected_ids
     return {response["id"]: response for response in responses}
+
+
+def run_stdio_stream(project_root, database_path, request_stream):
+    """Run one raw synthetic request stream through the stdio process."""
+    environment = os.environ.copy()
+    environment["BITCRACKER_AGENT_WORKSPACE"] = str(
+        database_path.resolve()
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "tools.agent_workspace_mcp"],
+        cwd=project_root,
+        env=environment,
+        input=request_stream,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def structured_tool_result(response):
+    """Validate and return one standard MCP structured tool result."""
+    encoded = json.dumps(response, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= MAX_RESPONSE_BYTES
+    result = response["result"]
+    assert set(result) == {"content", "structuredContent"}
+    assert len(result["content"]) == 1
+    content = result["content"][0]
+    assert content["type"] == "text"
+    parsed_text = json.loads(content["text"])
+    assert parsed_text == result["structuredContent"]
+    return result["structuredContent"]
 
 
 def test_schema_enforces_constraints(tmp_path):
@@ -685,6 +718,242 @@ def test_superseding_handoff_preserves_history(tmp_path):
     assert event_count(database_path) == original_events + 1
 
 
+def test_latest_superseding_handoff_controls_claim_gate(tmp_path):
+    workspace, _ = initialized_workspace(tmp_path)
+    workspace.create_run("run-1", "Synthetic correction run")
+    workspace.create_task("task-1", "run-1", "Receive correction")
+    workspace.publish_handoff(
+        "handoff-1",
+        "run-1",
+        "task-1",
+        "codex",
+        "claude",
+        "# Original\n",
+    )
+    correction = workspace.publish_handoff(
+        "handoff-2",
+        "run-1",
+        "task-1",
+        "codex",
+        "claude",
+        "# Correction\n",
+        supersedes_handoff_id="handoff-1",
+    )
+    workspace.acknowledge_handoff(
+        "handoff-2",
+        "claude",
+        correction.sha256,
+    )
+
+    claimed = workspace.claim_task("task-1", "claude", expected_version=0)
+
+    assert claimed.state == "claimed"
+
+
+def test_supersession_requires_same_run_task_and_recipient(tmp_path):
+    workspace, _ = initialized_workspace(tmp_path)
+    workspace.create_run("run-1", "First synthetic run")
+    workspace.create_run("run-2", "Second synthetic run")
+    workspace.create_task("task-1", "run-1", "Original task")
+    workspace.create_task("task-2", "run-1", "Different task")
+    workspace.create_task("task-3", "run-2", "Different run")
+    workspace.publish_handoff(
+        "handoff-1",
+        "run-1",
+        "task-1",
+        "codex",
+        "claude",
+        "# Original\n",
+    )
+    invalid_corrections = (
+        ("handoff-2", "run-1", "task-2", "claude"),
+        ("handoff-3", "run-2", "task-3", "claude"),
+        ("handoff-4", "run-1", "task-1", "other-agent"),
+    )
+
+    for handoff_id, run_id, task_id, recipient in invalid_corrections:
+        with pytest.raises(ConflictError):
+            workspace.publish_handoff(
+                handoff_id,
+                run_id,
+                task_id,
+                "codex",
+                recipient,
+                "# Invalid correction\n",
+                supersedes_handoff_id="handoff-1",
+            )
+
+
+def test_acknowledgment_rehashes_published_file(tmp_path):
+    database_path = tmp_path / "agent-workspace.db"
+    handoff_directory = tmp_path / "handoffs"
+    workspace = Workspace(
+        database_path,
+        handoff_directory=handoff_directory,
+    )
+    workspace.initialize()
+    workspace.create_run("run-1", "Synthetic tamper run")
+    workspace.create_task("task-1", "run-1", "Detect changed handoff")
+    published = workspace.publish_handoff(
+        "handoff-1",
+        "run-1",
+        "task-1",
+        "codex",
+        "claude",
+        "# Original\n",
+    )
+    handoff_path = handoff_directory / "handoff-1.md"
+    handoff_path.write_text("# Altered\n", encoding="utf-8")
+
+    with pytest.raises(ConflictError):
+        workspace.acknowledge_handoff(
+            "handoff-1",
+            "claude",
+            published.sha256,
+        )
+
+
+def test_repeated_acknowledgment_is_idempotent(tmp_path):
+    workspace, database_path = initialized_workspace(tmp_path)
+    workspace.create_run("run-1", "Synthetic acknowledgment run")
+    workspace.create_task("task-1", "run-1", "Acknowledge once")
+    published = workspace.publish_handoff(
+        "handoff-1",
+        "run-1",
+        "task-1",
+        "codex",
+        "claude",
+        "# Exact handoff\n",
+    )
+
+    first = workspace.acknowledge_handoff(
+        "handoff-1",
+        "claude",
+        published.sha256,
+    )
+    events_after_first = event_count(database_path)
+    second = workspace.acknowledge_handoff(
+        "handoff-1",
+        "claude",
+        published.sha256,
+    )
+
+    assert second == first
+    assert event_count(database_path) == events_after_first
+
+
+def test_stdio_rejects_bad_requests_and_continues(tmp_path):
+    database_path = tmp_path / "stdio-errors.db"
+    project_root = Path(__file__).resolve().parents[1]
+    requests = [
+        "{not-json}\n",
+        json.dumps(
+            rpc_call(
+                1,
+                "create_run",
+                {"run_id": "/", "label": "Invalid identifier"},
+            ),
+            separators=(",", ":"),
+        )
+        + "\n",
+        json.dumps(
+            rpc_call(
+                2,
+                "create_run",
+                {"run_id": "run-1", "label": "Valid synthetic run"},
+            ),
+            separators=(",", ":"),
+        )
+        + "\n",
+        json.dumps(
+            rpc_call(
+                3,
+                "create_run",
+                {"run_id": "run-1", "label": "Duplicate run"},
+            ),
+            separators=(",", ":"),
+        )
+        + "\n",
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/list",
+                "params": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+    ]
+
+    completed = run_stdio_stream(
+        project_root,
+        database_path,
+        "".join(requests),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    responses = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert len(responses) == 5
+    assert responses[0]["id"] is None
+    assert "error" in responses[0]
+    by_id = {
+        response["id"]: response
+        for response in responses
+        if response["id"] is not None
+    }
+    assert "error" in by_id[1]
+    assert structured_tool_result(by_id[2]) == {
+        "created": True,
+        "run_id": "run-1",
+    }
+    assert "error" in by_id[3]
+    assert tuple(
+        tool["name"] for tool in by_id[4]["result"]["tools"]
+    ) == ALLOWED_TOOL_NAMES
+
+
+def test_stdio_bounds_complete_response_and_request_line(tmp_path):
+    database_path = tmp_path / "stdio-bounds.db"
+    project_root = Path(__file__).resolve().parents[1]
+    oversized = {
+        "jsonrpc": "2.0",
+        "id": "x" * MAX_RESPONSE_BYTES,
+        "method": "tools/list",
+        "params": {},
+    }
+    valid = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    }
+    request_stream = (
+        json.dumps(oversized, separators=(",", ":"))
+        + "\n"
+        + json.dumps(valid, separators=(",", ":"))
+        + "\n"
+    )
+
+    completed = run_stdio_stream(
+        project_root,
+        database_path,
+        request_stream,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    response_lines = completed.stdout.splitlines()
+    assert len(response_lines) == 2
+    for line in response_lines:
+        assert len(line.encode("utf-8")) <= MAX_RESPONSE_BYTES
+    oversized_response = json.loads(response_lines[0])
+    assert oversized_response["id"] is None
+    assert "error" in oversized_response
+    assert json.loads(response_lines[1])["id"] == 1
+
+
 def test_two_clients_exchange_checkpoint(tmp_path):
     database_path = tmp_path / "shared-agent-workspace.db"
     project_root = Path(__file__).resolve().parents[1]
@@ -750,7 +1019,8 @@ def test_two_clients_exchange_checkpoint(tmp_path):
         tool["name"] for tool in first_responses[2]["result"]["tools"]
     )
     assert tool_names == ALLOWED_TOOL_NAMES
-    handoff_hash = first_responses[5]["result"]["handoff"]["sha256"]
+    published = structured_tool_result(first_responses[5])
+    handoff_hash = published["handoff"]["sha256"]
 
     second_responses = run_stdio_client(
         project_root,
@@ -778,9 +1048,11 @@ def test_two_clients_exchange_checkpoint(tmp_path):
             ),
         ],
     )
-    acknowledgment = second_responses[2]["result"]["acknowledgment"]
+    acknowledgment_result = structured_tool_result(second_responses[2])
+    acknowledgment = acknowledgment_result["acknowledgment"]
     assert acknowledgment["sha256"] == handoff_hash
-    assert second_responses[3]["result"]["task"]["state"] == "claimed"
+    claim_result = structured_tool_result(second_responses[3])
+    assert claim_result["task"]["state"] == "claimed"
 
     with sqlite3.connect(database_path) as connection:
         handoff_row = connection.execute(

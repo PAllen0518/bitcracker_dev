@@ -312,3 +312,29 @@ It does not authorize worktree creation, `.gitignore` edits, dependency
 installation, system configuration, external backup selection, recovery
 execution, personal-data access, Git history changes, or network transmission.
 Those actions require separate permission.
+
+## Approved amendment 1: review corrections
+
+Paul approved this corrective contract on 2026-09-27 after the Codex review of
+checkpoint `2026-09-27-21-claude`:
+
+- Bound and validate every JSON-RPC request and complete response. No encoded
+  request line or response may exceed 64 KiB.
+- Malformed JSON, invalid request envelopes, unknown methods, invalid tool
+  parameters, workspace validation failures, and database conflicts return a
+  bounded JSON-RPC error without terminating the stdio server. A later valid
+  request in the same process must still succeed.
+- `tools/call` returns a standard MCP `CallToolResult` with text content and
+  matching structured content, not a raw project-specific result object.
+- Only a latest, non-superseded handoff can gate claiming its task. Once the
+  latest correction is acknowledged, an unacknowledged predecessor cannot
+  continue blocking the claim.
+- A superseding handoff must match its predecessor's run, task, and recipient.
+- Acknowledgment re-reads the published handoff file and requires its current
+  SHA-256 to equal both the stored hash and the supplied hash.
+- Repeating the same exact acknowledgment is idempotent. It returns the
+  original acknowledgment timestamp and appends no duplicate event.
+
+The amendment adds no dependency, tool capability, network listener, recovery
+operation, secret access, or Git authority. Corrective tests continue to use
+synthetic metadata and temporary local storage only.

@@ -4,7 +4,9 @@ import copy
 import json
 import os
 import re
+import sqlite3
 import sys
+from collections.abc import Iterator
 from dataclasses import asdict
 from typing import Any
 
@@ -392,37 +394,164 @@ def _handle_request(
         params = request.get("params")
         if not isinstance(params, dict):
             raise McpRequestError("tool call params must be an object")
-        return dispatch_tool(
+        structured_result = dispatch_tool(
             workspace,
             params.get("name"),
             params.get("arguments", {}),
         )
+        text_result = json.dumps(
+            structured_result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return {
+            "content": [{"type": "text", "text": text_result}],
+            "structuredContent": structured_result,
+        }
     raise McpRequestError(f"unknown method {method!r}")
+
+
+def _request_identity(request: Any) -> tuple[bool, Any]:
+    """Validate a JSON-RPC request and return its id state."""
+    if not isinstance(request, dict):
+        raise McpRequestError("JSON-RPC request must be an object")
+    if request.get("jsonrpc") != "2.0":
+        raise McpRequestError("jsonrpc must be '2.0'")
+    method = request.get("method")
+    if not isinstance(method, str) or not method:
+        raise McpRequestError("method must be a non-empty string")
+
+    has_id = "id" in request
+    request_id = request.get("id")
+    valid_id = (
+        request_id is None
+        or isinstance(request_id, str)
+        or (
+            isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+        )
+    )
+    if has_id and not valid_id:
+        raise McpRequestError("id must be a string, integer, or null")
+    return has_id, request_id
+
+
+def _encode_response(response: dict[str, Any]) -> bytes:
+    """Encode one complete JSON-RPC response within the output bound."""
+    encoded = json.dumps(
+        response,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > MAX_RESPONSE_BYTES:
+        raise McpResponseTooLarge("JSON-RPC response exceeds 64 KiB")
+    return encoded
+
+
+def _error_response(
+    request_id: Any,
+    code: int,
+    message: str,
+) -> bytes:
+    """Return a bounded JSON-RPC error, dropping an oversized id."""
+    response = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
+    try:
+        return _encode_response(response)
+    except McpResponseTooLarge:
+        response["id"] = None
+        response["error"]["message"] = "JSON-RPC response exceeds 64 KiB"
+        return _encode_response(response)
+
+
+def _write_response(encoded: bytes) -> None:
+    """Write and flush one encoded JSON-RPC response line."""
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def _read_request_lines() -> Iterator[bytes | None]:
+    """Yield bounded request lines and mark oversized physical lines."""
+    while True:
+        line = sys.stdin.buffer.readline(MAX_RESPONSE_BYTES + 1)
+        if not line:
+            return
+        if len(line) > MAX_RESPONSE_BYTES:
+            while line and not line.endswith(b"\n"):
+                line = sys.stdin.buffer.readline(MAX_RESPONSE_BYTES + 1)
+            yield None
+            continue
+        yield line
+
+
+def _process_request(
+    workspace: Workspace,
+    request: dict[str, Any],
+    has_id: bool,
+    request_id: Any,
+) -> bytes | None:
+    """Process one valid envelope and encode any required response."""
+    try:
+        result = _handle_request(workspace, request)
+        if not has_id:
+            return None
+        response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        return _encode_response(response)
+    except (
+        McpRequestError,
+        WorkspaceError,
+        ValueError,
+        TypeError,
+        sqlite3.Error,
+        OSError,
+    ) as error:
+        if not has_id:
+            return None
+        return _error_response(request_id, -32000, str(error))
 
 
 def main() -> int:
     """Run the bounded newline-delimited JSON-RPC stdio server."""
     workspace = _workspace_from_environment()
-    for line in sys.stdin:
+    for line in _read_request_lines():
+        if line is None:
+            _write_response(
+                _error_response(
+                    None,
+                    -32600,
+                    "JSON-RPC request line exceeds 64 KiB",
+                )
+            )
+            continue
+
         stripped = line.strip()
         if not stripped:
             continue
-        request = json.loads(stripped)
-        request_id = request.get("id") if isinstance(request, dict) else None
-        if request_id is None:
-            # A notification carries no id and produces no response.
-            continue
         try:
-            result = _handle_request(workspace, request)
-            response = {"jsonrpc": "2.0", "id": request_id, "result": result}
-        except (McpRequestError, WorkspaceError) as error:
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32000, "message": str(error)},
-            }
-        sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+            request_text = stripped.decode("utf-8")
+            request = json.loads(request_text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            _write_response(_error_response(None, -32700, str(error)))
+            continue
+
+        try:
+            has_id, request_id = _request_identity(request)
+        except McpRequestError as error:
+            _write_response(_error_response(None, -32600, str(error)))
+            continue
+
+        encoded = _process_request(
+            workspace,
+            request,
+            has_id,
+            request_id,
+        )
+        if encoded is not None:
+            _write_response(encoded)
     return 0
 
 

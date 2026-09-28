@@ -577,8 +577,13 @@ class Workspace:
                 )
 
             unacknowledged = connection.execute(
-                "SELECT 1 FROM handoffs "
-                "WHERE task_id = ? AND acknowledged_at IS NULL LIMIT 1",
+                "SELECT 1 FROM handoffs AS current "
+                "WHERE current.task_id = ? "
+                "AND current.acknowledged_at IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM handoffs AS newer "
+                "WHERE newer.supersedes_handoff_id = current.id"
+                ") LIMIT 1",
                 (task_id,),
             ).fetchone()
             if unacknowledged is not None:
@@ -795,6 +800,22 @@ class Workspace:
                     f"handoff {handoff_id!r} is already published"
                 )
 
+            if supersedes_handoff_id is not None:
+                predecessor = connection.execute(
+                    "SELECT run_id, task_id, recipient FROM handoffs "
+                    "WHERE id = ?",
+                    (supersedes_handoff_id,),
+                ).fetchone()
+                expected_lineage = (run_id, task_id, recipient)
+                if (
+                    predecessor is None
+                    or tuple(predecessor) != expected_lineage
+                ):
+                    raise ConflictError(
+                        "superseding handoff must match run, task, and "
+                        "recipient"
+                    )
+
             connection.execute(
                 "INSERT INTO handoffs "
                 "(id, run_id, task_id, author, recipient, sha256, "
@@ -857,22 +878,60 @@ class Workspace:
         """Acknowledge the exact immutable handoff received by one agent."""
         _validate_identifier(handoff_id, "handoff_id")
         self._validate_shared_text(recipient)
+        if not isinstance(sha256, str) or not SHA256_PATTERN.fullmatch(sha256):
+            raise ValueError("sha256 must be 64 lowercase hexadecimal digits")
         with self._write_connection() as connection:
-            match = connection.execute(
-                "SELECT 1 FROM handoffs "
-                "WHERE id = ? AND recipient = ? AND sha256 = ?",
-                (handoff_id, recipient, sha256),
+            row = connection.execute(
+                "SELECT sha256, acknowledged_at FROM handoffs "
+                "WHERE id = ? AND recipient = ?",
+                (handoff_id, recipient),
             ).fetchone()
-            if match is None:
+            if row is None or row["sha256"] != sha256:
                 raise ConflictError(
                     f"handoff {handoff_id!r} acknowledgment does not match"
                 )
 
+            target_path = self.handoff_directory / f"{handoff_id}.md"
+            try:
+                if target_path.is_symlink() or not target_path.is_file():
+                    raise ConflictError(
+                        f"handoff {handoff_id!r} file is unavailable"
+                    )
+                if target_path.stat().st_size > MAX_SHARED_TEXT_BYTES:
+                    raise ConflictError(
+                        f"handoff {handoff_id!r} file exceeds 64 KiB"
+                    )
+                current_digest = hashlib.sha256(
+                    target_path.read_bytes()
+                ).hexdigest()
+            except OSError as error:
+                raise ConflictError(
+                    f"handoff {handoff_id!r} file is unreadable"
+                ) from error
+            if current_digest != row["sha256"]:
+                raise ConflictError(
+                    f"handoff {handoff_id!r} file hash does not match"
+                )
+
+            acknowledged_at = row["acknowledged_at"]
+            if acknowledged_at is not None:
+                return HandoffAcknowledgment(
+                    handoff_id=handoff_id,
+                    recipient=recipient,
+                    sha256=sha256,
+                    acknowledged_at=acknowledged_at,
+                )
+
             timestamp = _utc_now()
-            connection.execute(
-                "UPDATE handoffs SET acknowledged_at = ? WHERE id = ?",
+            cursor = connection.execute(
+                "UPDATE handoffs SET acknowledged_at = ? "
+                "WHERE id = ? AND acknowledged_at IS NULL",
                 (timestamp, handoff_id),
             )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"handoff {handoff_id!r} changed during acknowledgment"
+                )
             self._record_event(
                 connection,
                 entity_type="handoff",
