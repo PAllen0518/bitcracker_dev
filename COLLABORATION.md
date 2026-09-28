@@ -18,6 +18,8 @@ restate that detail, to avoid drift.
   branch delete). Agents prepare changes; Paul lands them.
 - When Paul denies an approval, the agent pauses and waits for clarification
   instead of taking an assumed next step. (Also in CLAUDE.md; applies to both.)
+- Neither Claude nor Codex stage or commit. All git commands are performed by
+  Paul.
 
 ## 2. Source of truth
 
