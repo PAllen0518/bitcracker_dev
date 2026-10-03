@@ -72,6 +72,24 @@ MUTANTS = [
         executable_variable="CUDA_TEST_EXE",
     ),
     Mutant(
+        name="drop_generation_check",
+        source=SAVE_FORMAT,
+        before=(
+            "    if (r.tool_version != SAVE_GENERATION_VERSION) "
+            "return SaveMismatch::Generation;"
+        ),
+        after=(
+            "    if (false && r.tool_version != SAVE_GENERATION_VERSION) "
+            "return SaveMismatch::Generation;"
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_reject_generation]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
         name="drop_prev_fail_loud",
         source=SAVE_FORMAT,
         before=(

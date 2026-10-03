@@ -22,6 +22,7 @@ pytestmark = pytest.mark.skipif(
 # progress counters sit after the magic/version, identity hashes, and the two
 # 512-byte path fields; a SHA-256 over the record body trails them.
 V1_MAGIC = b"MBCKSV1\x00"
+V1_TOOL_VERSION_OFF = 16   # gating candidate-generation version (uint32 LE)
 V1_COMBO_OFF = 1144        # combo_idx, then total_combos, passwords_checked
 V1_PERM_OFF = 1168         # perm_idx, then typo_idx
 V1_CHECKSUM_OFF = 1184     # SHA-256 over bytes [0, V1_CHECKSUM_OFF)
@@ -250,6 +251,22 @@ def test_cli_restore_refuses_changed_delimiter(tmp_path):
                       "--delimiter", ",")
     assert result.returncode != 0
     assert "delimiter" in result.stderr.lower()
+
+
+def test_cli_restore_refuses_generation_mismatch(tmp_path):
+    # A save written by a build with a different candidate-generation order must
+    # be refused at the real CLI, even though its checksum is valid (re-sealed)
+    # and every input matches. Resuming would silently skip/repeat candidates.
+    checkpoint = _autosaved_search(tmp_path)
+    data = bytearray(checkpoint.read_bytes())
+    current = struct.unpack_from("<I", data, V1_TOOL_VERSION_OFF)[0]
+    struct.pack_into("<I", data, V1_TOOL_VERSION_OFF, current + 1)
+    reseal_v1(data)  # valid checksum: the generation gate, not corruption, refuses
+    checkpoint.write_bytes(bytes(data))
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3")
+    assert result.returncode != 0
+    assert "generation" in result.stderr.lower()
+    assert not (tmp_path / "RECOVERED_PASSWORD.txt").exists()
 
 
 def test_cli_restore_refuses_corrupted_save(tmp_path):

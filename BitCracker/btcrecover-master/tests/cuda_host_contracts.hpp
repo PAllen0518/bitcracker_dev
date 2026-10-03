@@ -1158,6 +1158,142 @@ static void save_migrate_1064_raw_contract() {
             "reader misread the documented legacy offsets (ABI mismatch)");
 }
 
+// -----------------------------------------------------------------------------
+// Generation-version binding (GENERATION_BINDING_SPEC.md). A v1 save records the
+// candidate-generation version of the build that wrote it; --restore must refuse
+// to resume a save produced by a different generation order, which would silently
+// skip or repeat candidates.
+// -----------------------------------------------------------------------------
+
+// F1: a v1 save whose recorded generation differs from this build's must be
+// refused even when every other binding matches. The checksum is re-finalized
+// after tampering so the record passes the Corrupt gate and reaches Generation.
+static void save_reject_generation_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    r.tool_version = SAVE_GENERATION_VERSION + 1;   // a different generation order
+    finalize_record_checksum(r);                    // otherwise-valid record
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::Generation,
+            "save from a different candidate-generation order was not rejected");
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::None,
+            "matching generation was rejected");
+}
+
+// F5: generation is a build property and must be reported before input-identity
+// mismatches. A record that mismatches BOTH generation and token list reports
+// Generation first, so the user is told to use the matching build.
+static void save_generation_order_contract() {
+    uint8_t tA[32], tB[32], wh[32], yh[32];
+    label_hash("tokA", tA); label_hash("tokB", tB);
+    label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', tA, wh, yh, 0, 100, 0, 0, 0);
+    r.tool_version = SAVE_GENERATION_VERSION + 1;
+    finalize_record_checksum(r);
+    require(validate_save(r, tB, wh, ' ', yh, 100) == SaveMismatch::Generation,
+            "generation mismatch was not reported before the token-list mismatch");
+}
+
+// F3: every existing on-disk v1 save carries tool_version == 1. Shipping with
+// SAVE_GENERATION_VERSION == 1 must let those saves resume with no migration.
+static void save_generation_migrate_v1_contract() {
+    require(SAVE_GENERATION_VERSION == 1,
+            "shipping generation != 1 would refuse every existing v1 save (F3)");
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 7, 100, 9, 1, 2);
+    r.tool_version = 1;               // the value every historical v1 save carries
+    finalize_record_checksum(r);
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::None,
+            "an existing tool_version==1 v1 save was refused under generation 1");
+}
+
+// F4: fail closed. No wildcard/sentinel generation value bypasses the gate:
+// every value other than the build's own refuses; only the exact value resumes.
+static void save_generation_no_override_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    const uint32_t probes[] = {0u, 1u, 2u, 5u, 0x7fffffffu, 0xffffffffu};
+    for (uint32_t v : probes) {
+        SaveRecordV1 r;
+        build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+        r.tool_version = v;
+        finalize_record_checksum(r);
+        SaveMismatch got = validate_save(r, th, wh, ' ', yh, 100);
+        if (v == SAVE_GENERATION_VERSION) {
+            require(got == SaveMismatch::None,
+                    "the build's own generation value was refused");
+        } else {
+            require(got == SaveMismatch::Generation,
+                    "a non-matching generation value was accepted (no fail-closed gate)");
+        }
+    }
+}
+
+// F2 support: fingerprint the candidate-generation ORDER by hashing the trusted
+// reference oracle's output over a fixed battery of shapes (plain, typo-heavy,
+// optional + anchored). Deterministic, so a stable build yields a stable hex.
+static void generation_fingerprint(char out_hex[65]) {
+    struct Case { std::vector<TokenLine> lines; TypoConfig cfg; };
+    std::vector<Case> battery;
+    battery.push_back({small_lines(), TypoConfig{}});
+    {
+        TypoConfig t;
+        t.max_typos = 2; t.swap = true; t.repeat = true;
+        t.insert = true; t.insert_charset = "12";
+        battery.push_back({small_lines(), t});
+    }
+    battery.push_back({{{{"a", "b", "c"}, true, false, 0},
+                        {{"d", "e"}, false, false, 0},
+                        {{"Z"}, true, true, -1}},
+                       TypoConfig{}});
+    std::string blob;
+    for (const auto& c : battery) {
+        for (const auto& pw : reference_candidates(c.lines, c.cfg)) {
+            blob += pw;
+            blob.push_back('\n');
+        }
+        blob.push_back('\x1e');  // record separator between cases
+    }
+    uint8_t digest[32];
+    sha256_vec(std::vector<uint8_t>(blob.begin(), blob.end()), digest);
+    sha256_hex(digest, out_hex);
+}
+
+// F2: lock the candidate-generation ORDER to SAVE_GENERATION_VERSION. If the
+// order changes without a matching bump, the fingerprint drifts and this fails.
+// After a real bump, run this once and repin the printed fingerprint.
+static void save_generation_canary_contract() {
+    struct Pin { uint32_t version; const char* hex; };
+    static const Pin pins[] = {
+        {1, "595e40e868fca39275a52b5c17d6854a6696282755dfbe57c71b66393e74fde0"},
+    };
+    char hex[65];
+    generation_fingerprint(hex);
+    const char* expected = nullptr;
+    for (const auto& p : pins) {
+        if (p.version == SAVE_GENERATION_VERSION) expected = p.hex;
+    }
+    if (!expected) {
+        fprintf(stderr, "generation fingerprint for version %u = %s\n",
+                (unsigned)SAVE_GENERATION_VERSION, hex);
+        require(false,
+                "no pinned generation fingerprint for the current "
+                "SAVE_GENERATION_VERSION - a bump requires repinning this value");
+    }
+    if (std::string(hex) != expected) {
+        fprintf(stderr, "generation fingerprint expected %s got %s\n",
+                expected, hex);
+        require(false,
+                "candidate-generation ordering changed without bumping "
+                "SAVE_GENERATION_VERSION (or the pinned fingerprint is stale)");
+    }
+}
+
 static int run_host_contract(const std::string& name) {
     if (name == "assembly") assembly_contract();
     else if (name == "resume") resume_contract();
@@ -1205,6 +1341,13 @@ static int run_host_contract(const std::string& name) {
     else if (name == "save_migrate_1048") save_migrate_1048_contract();
     else if (name == "save_rebind_confirm") save_rebind_confirm_contract();
     else if (name == "save_rebind_roundtrip") save_rebind_roundtrip_contract();
+    else if (name == "save_reject_generation") save_reject_generation_contract();
+    else if (name == "save_generation_order") save_generation_order_contract();
+    else if (name == "save_generation_migrate_v1")
+        save_generation_migrate_v1_contract();
+    else if (name == "save_generation_no_override")
+        save_generation_no_override_contract();
+    else if (name == "save_generation_canary") save_generation_canary_contract();
     else if (name == "md5") md5_contract();
     else if (name == "pipeline") pipeline_contract(false);
     else if (name == "checkpoint") pipeline_contract(true);
