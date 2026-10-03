@@ -228,3 +228,119 @@ just for Paul.
   isolated worktree per §8.
 
 No open questions remain.
+
+---
+
+## Amendment 1 — verifier Round 1 corrections (APPROVED 2026-10-03)
+
+Status: **APPROVED by Paul 2026-10-03**, verbatim: "Amendment 1 approved". The
+approved text is the draft whose spec file hashed to SHA-256
+`9b491d5897c6a883296ed9b5d2b7a8df47fae5c72afb91d78943b1bb662b7960`; only this status
+paragraph and the heading changed afterwards. Written in response to
+`docs/handoffs/2026-10-03-30-codex.md` (verifier Round 1: failed). Sections 1–10 above remain
+the approved base (SHA-256 `a829be75…e329b4fd`); where this amendment conflicts, it
+governs. Invariants N1–N5 are unchanged.
+
+### A1. Canary covers every generation-affecting typo mode (V1)
+
+- `generation_fingerprint` gains one battery case per typo mode not already covered,
+  each mode enabled **alone**: capslock, delete, closecase (closecase uses a synthetic
+  token with a case transition). Existing cases are kept. Swap, repeat and insert stay
+  covered by the existing typo case.
+- **One-time gen-1 repin, no bump.** Growing the battery changes the gen-1 fingerprint
+  without changing candidate order, so the version stays `1` and existing saves keep
+  resuming (F3). This is allowed only because no pin table has reached the integration
+  branch yet (`master` has none; see A2 bootstrap). The new pin is derived once and
+  recorded in EVIDENCE with the old value.
+- **Known cost, accepted:** after merge, the battery itself is append-only through A2.
+  Changing the battery later changes the fingerprint and therefore needs a version bump,
+  which refuses existing saves (F6, availability, not data loss). A1 makes the battery
+  complete now to keep that rare.
+
+### A2. Bump enforcement: append-only pins (V2), replaces §5's canary claim
+
+The §5 claim that the canary "goes green only after the fingerprint is updated *and*
+the number bumped" was false for an editable pin table. New design:
+
+- The pin rows in `save_generation_canary_contract` sit between the marker comments
+  `// GENERATION-PINS-BEGIN` and `// GENERATION-PINS-END`, one `{version, "hex"},` row
+  per line.
+- New pure-Python checker `check_generation_pins(base_text, current_text,
+  generation_version)` plus a pytest that runs it on the real repo. It fails unless:
+  1. the base rows are an exact prefix of the current rows (no edit, delete or reorder);
+  2. versions are contiguous and ascending from 1;
+  3. every fingerprint is unique (also blocks a bump that has no real order change);
+  4. the last row's version equals `SAVE_GENERATION_VERSION` parsed from `save_format.hpp`.
+  The C++ canary still requires the live fingerprint to equal the pin for the current
+  version.
+- **Base:** the file at `git merge-base HEAD <ref>`, where `<ref>` is env
+  `GENERATION_PINS_BASE_REF` (default `master`). If the base file has no markers
+  (bootstrap, the current state), base rows are empty. If git or the ref is
+  unavailable, the test **fails** with a message naming the env var. It never skips.
+- Net effect: after an order change, the only green path is a new row plus a version
+  bump. Repinning row 1 fails (1). A duplicate version fails (2). A new row without a
+  bump fails (4). A bump that reuses a fingerprint fails (3).
+- The canary failure message drops "or the pinned fingerprint is stale" and says:
+  never edit an existing pin; bump `SAVE_GENERATION_VERSION` and append a row.
+- **Persisted negative controls, both directions** (pure-Python fixture tests of the
+  checker): repin without bump → fail; append row without bump → fail; duplicate
+  fingerprint → fail; delete or reorder → fail; bump plus new unique row → pass.
+- **Known limits (narrowed claim, stated plainly):** this blocks honest mistakes on a
+  branch measured against the integration branch. It does not stop a deliberate edit
+  of the checker, or an edit committed directly to `master` (there, merge-base equals
+  HEAD). F2's claim becomes "a forgotten bump fails the branch's suite", not that it is
+  impossible.
+
+### A3. Randomized generation-value property (V3)
+
+New host contract `save_generation_property`: explicit cases `SAVE_GENERATION_VERSION`,
+`0`, `SAVE_GENERATION_VERSION ± 1`, `0x7fffffff`, `0x80000000`, `0xffffffff`, then
+4,096 values from `std::mt19937_64(20261003)` cast to `uint32_t`. Each is written into a
+valid record, resealed, and passed to `validate_save`; the expected result is `None` iff
+the value equals the build constant, otherwise `Generation`. Added to the dispatch and
+the pytest list. Evidence stops calling the six-value test a "sweep".
+
+### A4. The refusal message is behavior (V4)
+
+The exact §4.1 message text is pinned two ways: a host contract asserting
+`mismatch_message(SaveMismatch::Generation)` equals it, and the CLI generation test
+asserting the full string appears in stderr (not just the word "generation").
+
+### A5. Persisted mutants and a real resume test (V5)
+
+- `tools/validate_save_format.py` gains multi-edit mutants (several exact-once edits,
+  across files if needed, all restored byte-exact or the run fails), plus:
+  `accept_generation_mismatch` (`!=`→`==`), `generation_after_tokenlist` (check moved
+  below the token-list check), `generation_wrong_constant` (compare to `0u`),
+  `generic_generation_message` (V4), `canary_capslock_reorder`,
+  `canary_delete_reorder`, `canary_closecase_reorder` (V1, reference-generator
+  reorders) and `canary_permutation_reverse` (the V2 attack). Each names the test that
+  must kill it. All must be killed; the existing six stay.
+- Disclosed survivor, not persisted as a required kill: comparing against
+  `SAVE_FORMAT_VERSION` is indistinguishable at generation 1 (both are 1).
+- `save_generation_migrate_v1` keeps its validation check, and its F3 mapping moves to
+  a new CLI test, `test_cli_restore_resumes_gen1_save_at_stored_position`. It autosaves
+  a synthetic search, confirms `tool_version == 1` in the file, sets a nonzero mid-run
+  position, reseals, restores, and asserts exit 0 with exactly the remaining count
+  checked. Synthetic fixtures only.
+
+### A6. Evidence corrections
+
+`GENERATION_BINDING_EVIDENCE.md` gets a new dated section; earlier sections are kept
+as history and marked superseded where wrong. It must: withdraw "F2 forgotten bump
+caught" in favour of the A2 claim and limits; disclose the original missing typo modes
+and the repin-without-bump result; replace "value sweep"; correct the F3 and message
+mappings; record verifier Round 1 (source `b093dc8`/`a8403da`, attacks, Python 3.14
+substitution, failed status); reconcile the "committed-source run pending" wording with
+handoff 29; and point every mutation and control at a persisted runner instead of prose.
+
+### A7. Files and sequencing
+
+Files: `tests/cuda_host_contracts.hpp`, `tests/test_cuda.py`, `tests/test_cuda_cli.py`,
+`tools/validate_save_format.py`, a new `tests/test_generation_pins.py`, this spec and
+the evidence report. `save_format.hpp` changes only if needed to expose the message
+for A4; there is no behavior change and no ABI change. `multibit_cuda_threads.cu` and
+`cuda_typos.hpp` are edited only inside the mutation harness's restored copies. Order:
+RED for each new check → GREEN → full gauntlet after the last edit → Paul commits →
+committed-source gauntlet → builder handoff → verifier Round 2 (the last round under
+the default cap).

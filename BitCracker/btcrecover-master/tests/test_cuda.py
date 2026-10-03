@@ -222,6 +222,8 @@ def test_streamed_typos_preserve_reference_order(flags, budget):
         "save_generation_migrate_v1",
         "save_generation_no_override",
         "save_generation_canary",
+        "save_generation_property",
+        "save_generation_message",
     ],
 )
 def test_native_contract(name):

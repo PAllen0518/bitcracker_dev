@@ -1234,6 +1234,50 @@ static void save_generation_no_override_contract() {
     }
 }
 
+// F4 property (Amendment 1, A3): explicit boundary values, then seeded random
+// ones. Only the build's own value resumes; every other value refuses.
+static void save_generation_property_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    std::vector<uint32_t> values = {
+        SAVE_GENERATION_VERSION, 0u, SAVE_GENERATION_VERSION - 1u,
+        SAVE_GENERATION_VERSION + 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu};
+    std::mt19937_64 generator(20261003);
+    for (int i = 0; i < 4096; ++i) {
+        values.push_back(static_cast<uint32_t>(generator()));
+    }
+    bool saw_equal = false, saw_unequal = false;
+    for (uint32_t v : values) {
+        SaveRecordV1 r;
+        build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+        r.tool_version = v;
+        finalize_record_checksum(r);
+        bool equal = v == SAVE_GENERATION_VERSION;
+        require(validate_save(r, th, wh, ' ', yh, 100)
+                    == (equal ? SaveMismatch::None : SaveMismatch::Generation),
+                "a generation value was not accepted iff it equals the build's own");
+        (equal ? saw_equal : saw_unequal) = true;
+    }
+    require(saw_equal && saw_unequal,
+            "generation property did not exercise both outcomes");
+}
+
+// The refusal text is user-facing behavior (spec 4.1, Amendment 1 A4).
+static void save_generation_message_contract() {
+    require(strcmp(mismatch_message(SaveMismatch::Generation),
+                   "save was written by a build with a different "
+                   "candidate-generation order; resume it with the matching "
+                   "build or start a new search") == 0,
+            "the generation-mismatch message differs from the approved text");
+}
+
+// Synthetic tokens next to case changes, so capslock and closecase have
+// letters to act on.
+static std::vector<TokenLine> case_lines() {
+    return {{{"aB", "c"}, true, false, 0},
+            {{"De"}, false, false, 0}};
+}
+
 // F2 support: fingerprint the candidate-generation ORDER by hashing the trusted
 // reference oracle's output over a fixed battery of shapes (plain, typo-heavy,
 // optional + anchored). Deterministic, so a stable build yields a stable hex.
@@ -1251,6 +1295,30 @@ static void generation_fingerprint(char out_hex[65]) {
                         {{"d", "e"}, false, false, 0},
                         {{"Z"}, true, true, -1}},
                        TypoConfig{}});
+    // One case per remaining typo mode, each alone, then every mode together
+    // so the order between options at one position is pinned too.
+    {
+        TypoConfig t;
+        t.max_typos = 1; t.capslock = true;
+        battery.push_back({case_lines(), t});
+    }
+    {
+        TypoConfig t;
+        t.max_typos = 2; t.del = true;
+        battery.push_back({case_lines(), t});
+    }
+    {
+        TypoConfig t;
+        t.max_typos = 2; t.closecase = true;
+        battery.push_back({case_lines(), t});
+    }
+    {
+        TypoConfig t;
+        t.max_typos = 2; t.capslock = true; t.swap = true; t.repeat = true;
+        t.del = true; t.closecase = true; t.insert = true;
+        t.insert_charset = "1";
+        battery.push_back({case_lines(), t});
+    }
     std::string blob;
     for (const auto& c : battery) {
         for (const auto& pw : reference_candidates(c.lines, c.cfg)) {
@@ -1265,12 +1333,15 @@ static void generation_fingerprint(char out_hex[65]) {
 }
 
 // F2: lock the candidate-generation ORDER to SAVE_GENERATION_VERSION. If the
-// order changes without a matching bump, the fingerprint drifts and this fails.
-// After a real bump, run this once and repin the printed fingerprint.
+// order changes, the fingerprint drifts and this fails. The pin rows are
+// append-only: tests/test_generation_pins.py fails if a row is edited, removed
+// or reordered, so the only green path is a version bump plus a new row.
 static void save_generation_canary_contract() {
     struct Pin { uint32_t version; const char* hex; };
     static const Pin pins[] = {
-        {1, "595e40e868fca39275a52b5c17d6854a6696282755dfbe57c71b66393e74fde0"},
+        // GENERATION-PINS-BEGIN
+        {1, "9c66679756f0a61c6c269f13ab37464340bc5d9a104009d734e2dc2af44b967f"},
+        // GENERATION-PINS-END
     };
     char hex[65];
     generation_fingerprint(hex);
@@ -1283,14 +1354,16 @@ static void save_generation_canary_contract() {
                 (unsigned)SAVE_GENERATION_VERSION, hex);
         require(false,
                 "no pinned generation fingerprint for the current "
-                "SAVE_GENERATION_VERSION - a bump requires repinning this value");
+                "SAVE_GENERATION_VERSION - append a row with the printed "
+                "fingerprint; never edit an existing row");
     }
     if (std::string(hex) != expected) {
         fprintf(stderr, "generation fingerprint expected %s got %s\n",
                 expected, hex);
         require(false,
-                "candidate-generation ordering changed without bumping "
-                "SAVE_GENERATION_VERSION (or the pinned fingerprint is stale)");
+                "candidate-generation ordering changed - never edit an "
+                "existing pin; bump SAVE_GENERATION_VERSION and append a row "
+                "with the printed fingerprint");
     }
 }
 
@@ -1348,6 +1421,10 @@ static int run_host_contract(const std::string& name) {
     else if (name == "save_generation_no_override")
         save_generation_no_override_contract();
     else if (name == "save_generation_canary") save_generation_canary_contract();
+    else if (name == "save_generation_property")
+        save_generation_property_contract();
+    else if (name == "save_generation_message")
+        save_generation_message_contract();
     else if (name == "md5") md5_contract();
     else if (name == "pipeline") pipeline_contract(false);
     else if (name == "checkpoint") pipeline_contract(true);

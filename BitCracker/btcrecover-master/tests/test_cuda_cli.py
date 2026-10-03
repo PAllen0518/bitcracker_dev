@@ -27,6 +27,11 @@ V1_COMBO_OFF = 1144        # combo_idx, then total_combos, passwords_checked
 V1_PERM_OFF = 1168         # perm_idx, then typo_idx
 V1_CHECKSUM_OFF = 1184     # SHA-256 over bytes [0, V1_CHECKSUM_OFF)
 V1_SIZE = 1216
+# Approved refusal text (GENERATION_BINDING_SPEC.md 4.1).
+GENERATION_MESSAGE = (
+    "save was written by a build with a different candidate-generation "
+    "order; resume it with the matching build or start a new search"
+)
 
 
 def reseal_v1(data):
@@ -266,7 +271,28 @@ def test_cli_restore_refuses_generation_mismatch(tmp_path):
     result = _restore(tmp_path, checkpoint, "--batch-size", "3")
     assert result.returncode != 0
     assert "generation" in result.stderr.lower()
+    assert GENERATION_MESSAGE in result.stderr
     assert not (tmp_path / "RECOVERED_PASSWORD.txt").exists()
+
+
+def test_cli_restore_resumes_gen1_save_at_stored_position(tmp_path):
+    # F3: an existing generation-1 save resumes where it stopped, not just
+    # validates. Mid-combination position: combo 0, second permutation.
+    checkpoint = _autosaved_search(tmp_path)
+    data = bytearray(checkpoint.read_bytes())
+    assert struct.unpack_from("<I", data, V1_TOOL_VERSION_OFF)[0] == 1
+    combo, total, _ = struct.unpack_from("<QQQ", data, V1_COMBO_OFF)
+    assert combo == total == 2
+    struct.pack_into("<Q", data, V1_COMBO_OFF, 0)      # combo_idx
+    struct.pack_into("<Q", data, V1_COMBO_OFF + 16, 1)  # passwords_checked
+    struct.pack_into("<QQ", data, V1_PERM_OFF, 1, 0)    # perm_idx, typo_idx
+    reseal_v1(data)
+    checkpoint.write_bytes(bytes(data))
+    result = _restore(tmp_path, checkpoint, "--batch-size", "3", "--timings")
+    assert result.returncode == 0, result.stderr
+    # 2 combos x 2 orderings = 4 candidates; 1 was checked before the save.
+    assert timing_values(result.stdout)["count"] == 3
+    assert "Not found" in result.stdout
 
 
 def test_cli_restore_refuses_corrupted_save(tmp_path):
