@@ -11,8 +11,11 @@ whose underlying reviewed code was
 Round 4 failed despite its passing standard gauntlet. Round 5's final Phase 2
 verdict is bounded PASS for the approved contract at `6cb35e8`. Paul approved
 closure under the existing named-test-failure rule on 2026-10-04. Its
-stricter-input Phase 1 FAIL remains frozen and explicit. Merge and
-shared-database setup remain unauthorized.
+stricter-input Phase 1 FAIL remains frozen and explicit. Paul integrated the
+candidate into `master` as `21b4c76` on 2026-10-04; read-only source-equivalence
+checks are recorded in the integration checkpoint below. No fresh gauntlet
+or blind verification was run on the merge commit. Shared-database setup,
+personal recovery, executable replacement and push remain separate gates.
 
 Companion to `GENERATION_BINDING_SPEC.md` (approved, gate 1 cleared 2026-09-27).
 Loop: Old Coder. Risk tier 3. This report is written so the change can be trusted
@@ -944,3 +947,84 @@ commit, merge, rebase, push, installed-executable replacement, recovery run,
 personal-artifact access or shared-database operation is authorized by this
 closure. No coordination-database gate was recorded or changed. Current
 shared-space readiness was not inspected and is not established here.
+
+## Primary-checkout integration checkpoint, 2026-10-04 UTC
+
+### Human-owned integration and authorization
+
+Paul committed the documentary closure as
+`70ce4d7e9974ce183d521f51021055df5f86c45e`. Its parent is the verified candidate
+`6cb35e838d997e339ec4ccdc1dcd51853fbb7dce`; it changes only the evidence report
+and adds handoffs 39/40/41. The code, tests and approved spec are unchanged.
+
+After separate approvals for command preparation, Paul preserved the primary
+checkout's documentation in path-scoped stash
+`6c12cd1338b81a195782a13cab3e037c8f23adef` and fetched the remote. He then
+fast-forwarded `master` to
+`2f422cb72f1b8b22ae4f0d0be1b3817f035b0ac8`, whose changes from `a2f171f`
+affect only `COLLABORATION.md`. He prepared the candidate merge without
+committing, reviewed its output, and made merge commit
+`21b4c76c5c0ede9aa04b1c48ef582c0e216fba6b` with those two parents in that order.
+No agent performed staging, stashing, fetching, merging or committing.
+
+Paul replied "yes" to the request for a read-only post-merge check. He then
+replied "yes" to: "May I record this integration checkpoint in the evidence
+report and a new handoff 42? Documentation only."
+
+### Actual read-only results
+
+Checks ran in the primary checkout on 2026-10-04, completed at 08:25:14 UTC
+and rechecked at 08:26:48 UTC before this documentary update:
+
+- `git status --short --branch`: exit 0, clean `master`, ahead 11 of the
+  fetched `bitcracker_dev/master`. No later network refresh was performed.
+- `git show --no-patch --format='%H%n%P%n%s' HEAD`: exit 0, returned the
+  merge ID and exact parents above.
+- `git diff --exit-code 6cb35e8 HEAD -- BitCracker/btcrecover-master
+  docs/specs/GENERATION_BINDING_SPEC.md`: exit 0, no code/test/spec changes.
+- `git diff --exit-code 70ce4d7 HEAD -- . ':(exclude)COLLABORATION.md'`:
+  exit 0, all other committed paths match the documentary candidate.
+- `git diff --exit-code 2f422cb HEAD -- COLLABORATION.md`: exit 0, remote
+  human-only Git rules retained without additional edits.
+- `git diff --cached --quiet` and `git diff --quiet`: both exit 0, index and
+  tracked working files match HEAD. `git status --porcelain` had no entries.
+- `git rev-parse refs/stash`: exit 0, returned the preserved documentation
+  stash above. `git stash show --include-untracked --name-status <stash>`:
+  exit 0, retained the scoped documentation, including the collaboration
+  relocation, older review handoffs and pre-integration spec/evidence drafts.
+- `Get-FileHash -Algorithm SHA256` on both frozen reports returned the
+  previously published Phase 1/2 hashes. Neither report was changed.
+
+The fresh bounded Phase 2 verdict remains attached to `6cb35e8`. The merge
+checks establish Git-level source/spec equivalence, not a new fresh test run,
+new independent verdict or operational certification at `21b4c76`.
+
+### Spec line endings and identity
+
+`git ls-files --eol` reports `i/lf w/crlf` for the primary spec. Its committed
+Git blob is `94df77f07f5748eecd68ef2f16fadcce716f825b`, identical to the
+approved candidate. The current primary raw-byte SHA-256 is
+`20e47a91ca0369cd9034f0af20715af449a8c2804db440f9cdf128cc25962945`.
+The retained candidate's approved raw hash remains
+`1a9b2c047c47b67b3c83c0e2675ce03460aacc7d98e4d9848c86e8e0c49eead9`.
+
+Reading the primary spec as text, replacing CRLF with LF, encoding as UTF-8
+and hashing produced the same approved candidate hash. Its normalized text
+also compares exactly to the candidate text. This is a disclosed checkout
+line-ending distinction, not a spec amendment. Do not compare the current
+primary raw hash to an LF file's hash and silently claim byte equality.
+
+### Remaining gates
+
+Only this evolving evidence report and new handoff 42 are changed by the
+documentary checkpoint. Handoffs 39/40/41 and frozen failed/passed verdicts
+remain immutable. No test, CUDA build, mutation, new verifier round, installed
+binary replacement, dependency installation, live recovery operation,
+personal-artifact access or coordination-database operation was performed.
+Recovery state was not rechecked and is `unknown` for this checkpoint.
+
+Next: Paul reviews and commits exactly the two documentary files in handoff
+42. Push requires its own approval. Keep the documentation stash intact;
+do not apply it wholesale over the integrated spec/evidence. Selective
+restoration or reconciliation of its other documents needs separate approval.
+Shared-space readiness is a separate question and was not inspected here.
