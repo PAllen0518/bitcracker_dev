@@ -1,20 +1,31 @@
 """Run fail-closed manual mutation tests for the v1 save format."""
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+import uuid
 from pathlib import Path
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / ".cuda-build"
 REPORT_DIR = BUILD / "save-format-mutation"
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
+class Edit:
+    """Describe one exact-once source replacement."""
+
+    source: Path
+    before: str
+    after: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Mutant:
     """Describe one unique source mutation and its killing test."""
 
@@ -25,10 +36,61 @@ class Mutant:
     build_target: str
     test: str
     executable_variable: str
+    extra_edits: tuple = ()
+    report_fault: str = ""  # "root" or "nested" (report controls only)
+
+    def edits(self):
+        """Return every edit, the primary one first."""
+        return (Edit(self.source, self.before, self.after),) + self.extra_edits
 
 
 SAVE_FORMAT = ROOT / "save_format.hpp"
 CUDA_SOURCE = ROOT / "multibit_cuda_threads.cu"
+HOST_CONTRACTS = ROOT / "tests/cuda_host_contracts.hpp"
+CANARY_TEST = (
+    "tests/test_cuda.py::test_native_contract[save_generation_canary]"
+)
+GENERATION_GATE = (
+    "    if (r.tool_version != SAVE_GENERATION_VERSION) "
+    "return SaveMismatch::Generation;"
+)
+CHECKSUM_GATE = (
+    "    if (!verify_record_checksum(r))              "
+    "return SaveMismatch::Corrupt;"
+)
+TOKENLIST_GATE = (
+    "    if (memcmp(r.tokenlist_hash, expected_tokenlist_hash, 32) != 0)\n"
+    "        return SaveMismatch::Tokenlist;"
+)
+GENERATION_MESSAGE = (
+    '        case SaveMismatch::Generation: return "save was written by a '
+    "build with a different candidate-generation order; resume it with the "
+    'matching build or start a new search";'
+)
+GENERIC_MESSAGE = '        case SaveMismatch::Generation: return "save mismatch";'
+# Reference typo stages hashed by the generation canary.
+KEEP_ORIGINAL = "        out.push_back(c);\n"
+CAPSLOCK_VARIANT = (
+    "        if (cfg.capslock && c.typos_used < cfg.max_typos) {\n"
+    "            std::string sw = swapcase_str(c.pw);\n"
+    "            if (sw != c.pw) out.push_back({sw, c.typos_used + 1});\n"
+    "        }\n"
+)
+REPEAT_OPTION = (
+    "            if (cfg.repeat) opts.push_back(std::string(2, base[i]));\n"
+)
+DELETE_OPTION = "            if (cfg.del)    opts.push_back(std::string());\n"
+CLOSECASE_OPTION = (
+    "            if (cfg.closecase && is_case_transition(base, i)) {\n"
+    "                char sc = swap_case_ch(base[i]);\n"
+    "                if (sc != base[i]) opts.push_back(std::string(1, sc));\n"
+    "            }\n"
+)
+FREE_GUARD = "        if (free_count == 0) continue;\n"
+REFERENCE_PERMUTATION = (
+    "        } while (std::next_permutation(permutation, "
+    "permutation + free_count));"
+)
 
 
 MUTANTS = [
@@ -68,6 +130,24 @@ MUTANTS = [
         build_target="optimized_test",
         test=(
             "tests/test_cuda.py::test_native_contract[save_reject_wallet]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="drop_generation_check",
+        source=SAVE_FORMAT,
+        before=(
+            "    if (r.tool_version != SAVE_GENERATION_VERSION) "
+            "return SaveMismatch::Generation;"
+        ),
+        after=(
+            "    if (false && r.tool_version != SAVE_GENERATION_VERSION) "
+            "return SaveMismatch::Generation;"
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_reject_generation]"
         ),
         executable_variable="CUDA_TEST_EXE",
     ),
@@ -126,6 +206,146 @@ MUTANTS = [
         ),
         executable_variable="CUDA_APP_EXE",
     ),
+    Mutant(
+        name="accept_generation_mismatch",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE,
+        after=GENERATION_GATE.replace("!=", "=="),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_property]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="generation_after_tokenlist",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE + "\n" + TOKENLIST_GATE,
+        after=TOKENLIST_GATE + "\n" + GENERATION_GATE,
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_order]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="generation_wrong_constant",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE,
+        after=GENERATION_GATE.replace("SAVE_GENERATION_VERSION", "0u"),
+        build_target="optimized",
+        test=(
+            "tests/test_cuda_cli.py::"
+            "test_cli_restore_resumes_gen1_save_at_stored_position"
+        ),
+        executable_variable="CUDA_APP_EXE",
+    ),
+    Mutant(
+        name="generic_generation_message",
+        source=SAVE_FORMAT,
+        before=GENERATION_MESSAGE,
+        after=GENERIC_MESSAGE,
+        build_target="optimized",
+        test=(
+            "tests/test_cuda_cli.py::"
+            "test_cli_restore_refuses_generation_mismatch"
+        ),
+        executable_variable="CUDA_APP_EXE",
+    ),
+    Mutant(
+        name="generic_generation_message_host",
+        source=SAVE_FORMAT,
+        before=GENERATION_MESSAGE,
+        after=GENERIC_MESSAGE,
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_message]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="canary_capslock_reorder",
+        source=CUDA_SOURCE,
+        before=KEEP_ORIGINAL + CAPSLOCK_VARIANT,
+        after=CAPSLOCK_VARIANT + KEEP_ORIGINAL,
+        build_target="optimized_test",
+        test=CANARY_TEST,
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="canary_delete_reorder",
+        source=CUDA_SOURCE,
+        before=REPEAT_OPTION + DELETE_OPTION,
+        after=DELETE_OPTION + REPEAT_OPTION,
+        build_target="optimized_test",
+        test=CANARY_TEST,
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="canary_closecase_reorder",
+        source=CUDA_SOURCE,
+        before=REPEAT_OPTION + DELETE_OPTION + CLOSECASE_OPTION,
+        after=CLOSECASE_OPTION + REPEAT_OPTION + DELETE_OPTION,
+        build_target="optimized_test",
+        test=CANARY_TEST,
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="canary_permutation_reverse",
+        source=HOST_CONTRACTS,
+        before=FREE_GUARD,
+        after=FREE_GUARD
+        + "        std::reverse(permutation, permutation + free_count);\n",
+        extra_edits=(
+            Edit(
+                HOST_CONTRACTS,
+                REFERENCE_PERMUTATION,
+                REFERENCE_PERMUTATION.replace("next_", "prev_"),
+            ),
+        ),
+        build_target="optimized_test",
+        test=CANARY_TEST,
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        # Edits apply in order: remove the gate, then reinsert it before the
+        # checksum check.
+        name="generation_before_checksum",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE + "\n",
+        after="",
+        extra_edits=(
+            Edit(
+                SAVE_FORMAT,
+                CHECKSUM_GATE,
+                GENERATION_GATE + "\n" + CHECKSUM_GATE,
+            ),
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_after_checksum]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="accept_generation_three",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE,
+        after=GENERATION_GATE.replace(
+            "SAVE_GENERATION_VERSION)",
+            "SAVE_GENERATION_VERSION && r.tool_version != 3u)",
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_property]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
 ]
 
 
@@ -141,6 +361,190 @@ NEGATIVE_CONTROL = Mutant(
     test="tests/test_cuda.py::test_native_contract[save_roundtrip]",
     executable_variable="CUDA_TEST_EXE",
 )
+
+
+# A real, divergent mutant whose named killing test does not exist. pytest
+# exits 4 without running anything; the driver must report a runner error,
+# never a kill.
+RUNNER_CONTROL = Mutant(
+    name="runner_error_control",
+    source=SAVE_FORMAT,
+    before=GENERATION_GATE,
+    after=GENERATION_GATE.replace("!=", "=="),
+    build_target="optimized_test",
+    test="tests/test_cuda.py::test_native_contract[no_such_contract]",
+    executable_variable="CUDA_TEST_EXE",
+)
+
+# Real, divergent mutants whose named test genuinely runs and fails, but whose
+# JUnit report is then corrupted: its root renamed, or an <error> hidden inside
+# <system-err>. A report the driver does not recognize must be a runner error,
+# never a kill.
+REPORT_CONTROL = Mutant(
+    name="report_error_control",
+    source=SAVE_FORMAT,
+    before=GENERATION_GATE,
+    after=GENERATION_GATE.replace("!=", "=="),
+    build_target="optimized_test",
+    test="tests/test_cuda.py::test_native_contract[save_reject_generation]",
+    executable_variable="CUDA_TEST_EXE",
+    report_fault="root",
+)
+REPORT_NESTED_CONTROL = dataclasses.replace(
+    REPORT_CONTROL, name="report_nested_control", report_fault="nested"
+)
+REPORT_CONTROLS = [REPORT_CONTROL, REPORT_NESTED_CONTROL]
+
+
+def corrupt_report_root(junit_text):
+    """Rename the JUnit root element, leaving every test case intact."""
+    root = ElementTree.fromstring(junit_text)
+    root.tag = "not_junit"
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+# Exit codes: every mutant killed; a mutant survived; a build or test run
+# failed for any other reason, so the result is unknown.
+EXIT_ALL_KILLED = 0
+EXIT_SURVIVOR = 1
+EXIT_RUNNER_ERROR = 2
+EXIT_CONTROL_BROKEN = 3  # a report control did not hold
+
+
+def hide_report_error(junit_text):
+    """Hide an <error> inside <system-err> of the test case, beside its outcome."""
+    root = ElementTree.fromstring(junit_text)
+    case = next(root.iter("testcase"))
+    hidden = ElementTree.SubElement(case, "system-err")
+    ElementTree.SubElement(hidden, "error", message="injected hidden error")
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+def report_control_exit(results):
+    """Return 2 only if every report control held, else EXIT_CONTROL_BROKEN.
+
+    Both controls must run, fail cleanly before injection, reject the fault,
+    and restore their source bytes.
+    """
+    held = len(results) == len(REPORT_CONTROLS) and all(
+        item.get("build_exit_code") == 0
+        and item.get("test_exit_code") == 1
+        and item.get("clean_status") == "killed"
+        and item.get("restored") is True
+        and item["status"] == "runner_error"
+        for item in results
+    )
+    return EXIT_RUNNER_ERROR if held else EXIT_CONTROL_BROKEN
+
+
+def junit_identity(test):
+    """Map a pytest node ID to its JUnit (classname, name) pair."""
+    path, *parts = test.split("::")
+    module = path.removesuffix(".py").replace("/", ".")
+    return ".".join([module, *parts[:-1]]), parts[-1]
+
+
+# The pytest JUnit layout this driver accepts. Anything else is unknown.
+OUTCOME_TAGS = {"failure", "error", "skipped"}
+OUTPUT_TAGS = {"properties", "system-out", "system-err"}
+
+
+def check_report_leaf(element):
+    """Require an outcome or output element to hold text only, else raise.
+
+    <properties> may hold only childless <property> elements. Text, escaped
+    markup and CDATA are fine; nested elements could hide an outcome.
+    """
+    if element.tag == "properties":
+        for item in element:
+            if item.tag != "property" or len(item):
+                raise RuntimeError(
+                    f"unexpected JUnit <properties> content: <{item.tag}>"
+                )
+    elif len(element):
+        raise RuntimeError(
+            f"unexpected elements inside JUnit <{element.tag}>: "
+            f"{sorted({child.tag for child in element})}"
+        )
+
+
+def report_testcase(root):
+    """Return the single test case of a pytest JUnit report, else raise.
+
+    Accepted: <testsuites> holding one <testsuite>, or a bare <testsuite>.
+    The suite holds exactly one <testcase> plus optional output elements, and
+    the case holds only outcome and output elements. Properties contain only
+    property leaves; other output and outcome elements hold text only.
+    """
+    suite = root
+    if root.tag == "testsuites":
+        children = list(root)
+        if len(children) != 1 or children[0].tag != "testsuite":
+            raise RuntimeError(
+                "JUnit <testsuites> must hold exactly one <testsuite>"
+            )
+        suite = children[0]
+    elif root.tag != "testsuite":
+        raise RuntimeError(f"not a JUnit report: root is <{root.tag}>")
+    unknown = {child.tag for child in suite} - {"testcase"} - OUTPUT_TAGS
+    if unknown:
+        raise RuntimeError(f"unexpected JUnit suite content: {sorted(unknown)}")
+    cases = [child for child in suite if child.tag == "testcase"]
+    if len(cases) != 1:
+        raise RuntimeError(f"expected one test case, found {len(cases)}")
+    unknown = {child.tag for child in cases[0]} - OUTCOME_TAGS - OUTPUT_TAGS
+    if unknown:
+        raise RuntimeError(f"unexpected JUnit test content: {sorted(unknown)}")
+    for element in suite:
+        if element.tag != "testcase":
+            check_report_leaf(element)
+    for element in cases[0]:
+        check_report_leaf(element)
+    return cases[0]
+
+
+def classify_test(returncode, junit_text, test):
+    """Return "killed" or "survived" from one pytest run, else raise.
+
+    A kill is exit 1 with the named test failing in the JUnit report; a
+    survivor is exit 0 with it passing. Anything else means the test did not
+    run as asked, so the result is unknown.
+    """
+    if returncode not in (0, 1):
+        raise RuntimeError(f"pytest exited {returncode}")
+    if junit_text is None:
+        raise RuntimeError("pytest wrote no JUnit report")
+    try:
+        root = ElementTree.fromstring(junit_text)
+    except ElementTree.ParseError as error:
+        raise RuntimeError(f"unreadable JUnit report: {error}") from error
+    case = report_testcase(root)
+    if (case.get("classname"), case.get("name")) != junit_identity(test):
+        raise RuntimeError(
+            f"ran {case.get('classname')}::{case.get('name')}, not {test}"
+        )
+    outcomes = [child.tag for child in case if child.tag in OUTCOME_TAGS]
+    if len(outcomes) > 1:
+        raise RuntimeError(f"test has several outcomes: {outcomes}")
+    if outcomes and outcomes[0] != "failure":
+        raise RuntimeError(f"test did not run cleanly: {outcomes}")
+    failed = outcomes == ["failure"]
+    if failed != (returncode == 1):
+        raise RuntimeError(
+            f"pytest exited {returncode} but the test "
+            f"{'failed' if failed else 'passed'}"
+        )
+    return "killed" if failed else "survived"
+
+
+def exit_code(results):
+    """Return the driver exit code for a list of mutant results."""
+    statuses = {item["status"] for item in results}
+    if statuses - {"killed", "survived"}:
+        return EXIT_RUNNER_ERROR
+    if "survived" in statuses:
+        return EXIT_SURVIVOR
+    return EXIT_ALL_KILLED
 
 
 def sha256(data):
@@ -166,43 +570,57 @@ def run_command(command, environment, log_path):
     return result
 
 
-def apply_unique_mutation(mutant, original):
-    """Apply exactly one expected replacement or fail closed."""
-    text = original.decode("utf-8").replace("\r\n", "\n")
-    count = text.count(mutant.before)
-    if count != 1:
-        raise RuntimeError(
-            f"{mutant.name}: expected one source match, found {count}"
+def apply_unique_mutation(mutant, originals):
+    """Apply every expected exact-once replacement or fail closed."""
+    texts = {
+        path: data.decode("utf-8").replace("\r\n", "\n")
+        for path, data in originals.items()
+    }
+    for edit in mutant.edits():
+        count = texts[edit.source].count(edit.before)
+        if count != 1:
+            raise RuntimeError(
+                f"{mutant.name}: expected one source match, found {count}"
+            )
+        texts[edit.source] = texts[edit.source].replace(
+            edit.before, edit.after, 1
         )
-    mutated = text.replace(mutant.before, mutant.after, 1).encode("utf-8")
-    if sha256(mutated) == sha256(original):
-        raise RuntimeError(f"{mutant.name}: mutation did not change source")
+    mutated = {path: text.encode("utf-8") for path, text in texts.items()}
+    for path, data in mutated.items():
+        if sha256(data) == sha256(originals[path]):
+            raise RuntimeError(
+                f"{mutant.name}: mutation did not change {path.name}"
+            )
     return mutated
 
 
 def run_mutant(mutant):
     """Build a mutant, require a test kill, and restore source bytes."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    original = mutant.source.read_bytes()
-    original_hash = sha256(original)
+    sources = list(dict.fromkeys(edit.source for edit in mutant.edits()))
+    originals = {path: path.read_bytes() for path in sources}
+    original_hashes = {path: sha256(data) for path, data in originals.items()}
     suffix = f"_mut_{mutant.name}"
     executable = BUILD / f"{mutant.build_target}{suffix}.exe"
     result = {
         "name": mutant.name,
-        "source": str(mutant.source.relative_to(ROOT)),
-        "original_sha256": original_hash,
+        "source": ", ".join(str(path.relative_to(ROOT)) for path in sources),
+        "original_sha256": ", ".join(original_hashes.values()),
         "build_target": mutant.build_target,
         "test": mutant.test,
         "restored": False,
     }
     try:
-        mutated = apply_unique_mutation(mutant, original)
-        mutant.source.write_bytes(mutated)
-        result["mutated_sha256"] = sha256(mutant.source.read_bytes())
-        if result["mutated_sha256"] != sha256(mutated):
-            raise RuntimeError(
-                f"{mutant.name}: mutated source was not written"
-            )
+        mutated = apply_unique_mutation(mutant, originals)
+        for path, data in mutated.items():
+            path.write_bytes(data)
+            if sha256(path.read_bytes()) != sha256(data):
+                raise RuntimeError(
+                    f"{mutant.name}: mutated source was not written"
+                )
+        result["mutated_sha256"] = ", ".join(
+            sha256(data) for data in mutated.values()
+        )
 
         environment = os.environ.copy()
         build_command = [
@@ -223,7 +641,11 @@ def run_mutant(mutant):
             return result
 
         environment[mutant.executable_variable] = str(executable)
-        pytest_temp = REPORT_DIR / f"pytest-{mutant.name}"
+        # A fresh directory per run: pytest must clear --basetemp first, and a
+        # stale one it cannot delete turns the run into a setup error.
+        pytest_temp = REPORT_DIR / f"pytest-{mutant.name}-{uuid.uuid4().hex[:8]}"
+        junit = REPORT_DIR / f"{mutant.name}-junit.xml"
+        junit.unlink(missing_ok=True)
         test_command = [
             sys.executable,
             "-m",
@@ -231,6 +653,7 @@ def run_mutant(mutant):
             mutant.test,
             "-q",
             f"--basetemp={pytest_temp}",
+            f"--junitxml={junit}",
         ]
         test = run_command(
             test_command,
@@ -238,35 +661,109 @@ def run_mutant(mutant):
             REPORT_DIR / f"{mutant.name}-test.txt",
         )
         result["test_exit_code"] = test.returncode
-        result["status"] = "killed" if test.returncode != 0 else "survived"
+        junit_text = (
+            junit.read_text(encoding="utf-8") if junit.exists() else None
+        )
+        if mutant.report_fault and junit_text is not None:
+            # Classify the untouched report first, so a control only holds when
+            # the injected fault alone turns a real kill into a runner error.
+            try:
+                result["clean_status"] = classify_test(
+                    test.returncode, junit_text, mutant.test
+                )
+            except RuntimeError as error:
+                result["clean_status"] = "runner_error"
+                result["clean_runner_error"] = str(error)
+            if mutant.report_fault == "root":
+                junit_text = corrupt_report_root(junit_text)
+                result["report_fault"] = "JUnit root renamed to not_junit"
+            else:
+                junit_text = hide_report_error(junit_text)
+                result["report_fault"] = "<error> hidden inside <system-err>"
+            faulted_report = junit.with_name(f"{mutant.name}-faulted.xml")
+            faulted_report.write_text(junit_text, encoding="utf-8")
+            result["faulted_report"] = str(faulted_report.relative_to(ROOT))
+        try:
+            result["status"] = classify_test(
+                test.returncode, junit_text, mutant.test
+            )
+        except RuntimeError as error:
+            result["status"] = "runner_error"
+            result["runner_error"] = str(error)
         return result
     finally:
-        mutant.source.write_bytes(original)
-        restored_hash = sha256(mutant.source.read_bytes())
-        result["restored"] = restored_hash == original_hash
-        result["restored_sha256"] = restored_hash
+        for path, data in originals.items():
+            path.write_bytes(data)
+        restored = {path: sha256(path.read_bytes()) for path in sources}
+        result["restored"] = restored == original_hashes
+        result["restored_sha256"] = ", ".join(restored.values())
         if not result["restored"]:
             raise RuntimeError(f"{mutant.name}: exact source restore failed")
 
 
 def main():
-    """Run all required mutants or the known-survivor negative control."""
+    """Run the required mutants, a selection of them, or one driver control."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--negative-control",
         action="store_true",
         help="prove the driver fails when a mutant survives",
     )
-    arguments = parser.parse_args()
-    selected = [NEGATIVE_CONTROL] if arguments.negative_control else MUTANTS
-    results = [run_mutant(mutant) for mutant in selected]
-    report_name = (
-        "mutation-negative-control.json"
-        if arguments.negative_control
-        else "mutation-report.json"
+    parser.add_argument(
+        "--runner-control",
+        action="store_true",
+        help="prove the driver fails when the killing test never runs",
     )
+    parser.add_argument(
+        "--report-control",
+        action="store_true",
+        help="prove the driver fails on a test report it does not recognize",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="run only the named mutant; repeat to select several",
+    )
+    arguments = parser.parse_args()
+    modes = [
+        flag for flag, chosen in (
+            ("--negative-control", arguments.negative_control),
+            ("--runner-control", arguments.runner_control),
+            ("--report-control", arguments.report_control),
+            ("--only", bool(arguments.only)),
+        ) if chosen
+    ]
+    if len(modes) > 1:
+        parser.error(f"choose one of: {', '.join(modes)}")
+    selected = MUTANTS
+    if arguments.negative_control:
+        selected = [NEGATIVE_CONTROL]
+    if arguments.runner_control:
+        selected = [RUNNER_CONTROL]
+    if arguments.report_control:
+        selected = REPORT_CONTROLS
+    if arguments.only:
+        known = {mutant.name: mutant for mutant in MUTANTS}
+        unknown = sorted(set(arguments.only) - set(known))
+        if unknown:
+            parser.error(f"unknown mutant: {', '.join(unknown)}")
+        selected = [known[name] for name in arguments.only]
+    results = [run_mutant(mutant) for mutant in selected]
+    if arguments.negative_control:
+        report_name = "mutation-negative-control.json"
+    elif arguments.runner_control:
+        report_name = "mutation-runner-control.json"
+    elif arguments.report_control:
+        report_name = "mutation-report-control.json"
+    elif arguments.only:
+        report_name = "mutation-selected.json"
+    else:
+        report_name = "mutation-report.json"
     report = {
         "negative_control": arguments.negative_control,
+        "runner_control": arguments.runner_control,
+        "report_control": arguments.report_control,
         "results": results,
         "killed": sum(item["status"] == "killed" for item in results),
         "total": len(results),
@@ -282,9 +779,11 @@ def main():
             f"test={item.get('test_exit_code')}, "
             f"restored={item['restored']})"
         )
-    if any(item["status"] != "killed" for item in results):
-        return 1
-    return 0
+        if "runner_error" in item:
+            print(f"  runner error: {item['runner_error']}")
+    if arguments.report_control:
+        return report_control_exit(results)
+    return exit_code(results)
 
 
 if __name__ == "__main__":

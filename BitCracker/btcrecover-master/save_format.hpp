@@ -237,7 +237,18 @@ static void typo_hash(const TypoConfig& c, uint8_t out[32]) {
 
 static const char     SAVE_MAGIC_V1[8]     = {'M','B','C','K','S','V','1','\0'};
 static const uint32_t SAVE_FORMAT_VERSION  = 1;
-static const uint32_t SAVE_TOOL_VERSION    = 1;
+// Gating candidate-generation version. BUMP THIS BY ONE whenever a change alters
+// the candidate-generation ORDER (token radix mixing, permutation order, or typo
+// expansion order/content). --restore fails loud when a save's recorded value
+// differs, because resuming a different order silently skips/repeats candidates.
+// The `save_generation_canary` host contract locks the ordering to this number:
+// change the order without bumping and the canary fails the build; after a real
+// bump, repin the fingerprint it prints. See GENERATION_BINDING_SPEC.md.
+static const uint32_t SAVE_GENERATION_VERSION = 1;
+// Retained name for the on-disk `tool_version` field's writer/constant so the
+// pre-existing save_identity contract compiles unchanged (spec N2). It now serves
+// the gating generation role above; keep it equal to SAVE_GENERATION_VERSION.
+static const uint32_t SAVE_TOOL_VERSION    = SAVE_GENERATION_VERSION;
 
 #pragma pack(push, 1)
 struct SaveRecordV1 {
@@ -297,7 +308,7 @@ static void build_record_v1(
     memcpy(r.magic, SAVE_MAGIC_V1, 8);
     r.format_version = SAVE_FORMAT_VERSION;
     r.header_size    = static_cast<uint32_t>(SAVE_RECORD_V1_SIZE);
-    r.tool_version   = SAVE_TOOL_VERSION;
+    r.tool_version   = SAVE_GENERATION_VERSION;  // gating candidate-generation version
     r.delimiter      = delimiter;
     memcpy(r.tokenlist_hash, tok_hash, 32);
     memcpy(r.wallet_id_hash, wal_hash, 32);
@@ -313,7 +324,7 @@ static void build_record_v1(
 }
 
 enum class SaveMismatch {
-    None, BadMagic, BadVersion, Corrupt,
+    None, BadMagic, BadVersion, Corrupt, Generation,
     Tokenlist, Wallet, Delimiter, Typos, ComboCount
 };
 
@@ -323,6 +334,7 @@ static const char* mismatch_message(SaveMismatch m) {
         case SaveMismatch::BadMagic:   return "not a recognized save file (bad magic)";
         case SaveMismatch::BadVersion: return "save was written by a newer tool version";
         case SaveMismatch::Corrupt:    return "save file is corrupt or truncated (checksum mismatch)";
+        case SaveMismatch::Generation: return "save was written by a build with a different candidate-generation order; resume it with the matching build or start a new search";
         case SaveMismatch::Tokenlist:  return "token-list file differs from the one this save was bound to";
         case SaveMismatch::Wallet:     return "wallet differs from the one this save was bound to";
         case SaveMismatch::Delimiter:  return "--delimiter differs from the one this save was bound to";
@@ -345,6 +357,12 @@ static SaveMismatch validate_save(
     if (memcmp(r.magic, SAVE_MAGIC_V1, 8) != 0) return SaveMismatch::BadMagic;
     if (r.format_version > SAVE_FORMAT_VERSION)  return SaveMismatch::BadVersion;
     if (!verify_record_checksum(r))              return SaveMismatch::Corrupt;
+    // Generation gate: after the bytes are known intact, refuse a save whose
+    // candidate-generation order differs from this build's. Resuming a different
+    // order would silently skip/repeat candidates. Checked before the input
+    // identities because a wrong-order build cannot honor the stored indices at
+    // all, whatever inputs are supplied.
+    if (r.tool_version != SAVE_GENERATION_VERSION) return SaveMismatch::Generation;
     if (memcmp(r.tokenlist_hash, expected_tokenlist_hash, 32) != 0)
         return SaveMismatch::Tokenlist;
     if (memcmp(r.wallet_id_hash, expected_wallet_hash, 32) != 0)
