@@ -219,6 +219,7 @@ def test_streamed_typos_preserve_reference_order(flags, budget):
         "save_rebind_roundtrip",
         "save_reject_generation",
         "save_generation_order",
+        "save_generation_after_checksum",
         "save_generation_migrate_v1",
         "save_generation_no_override",
         "save_generation_canary",

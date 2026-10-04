@@ -6,8 +6,10 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / ".cuda-build"
@@ -50,6 +52,10 @@ CANARY_TEST = (
 GENERATION_GATE = (
     "    if (r.tool_version != SAVE_GENERATION_VERSION) "
     "return SaveMismatch::Generation;"
+)
+CHECKSUM_GATE = (
+    "    if (!verify_record_checksum(r))              "
+    "return SaveMismatch::Corrupt;"
 )
 TOKENLIST_GATE = (
     "    if (memcmp(r.tokenlist_hash, expected_tokenlist_hash, 32) != 0)\n"
@@ -303,6 +309,42 @@ MUTANTS = [
         test=CANARY_TEST,
         executable_variable="CUDA_TEST_EXE",
     ),
+    Mutant(
+        # Edits apply in order: remove the gate, then reinsert it before the
+        # checksum check.
+        name="generation_before_checksum",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE + "\n",
+        after="",
+        extra_edits=(
+            Edit(
+                SAVE_FORMAT,
+                CHECKSUM_GATE,
+                GENERATION_GATE + "\n" + CHECKSUM_GATE,
+            ),
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_after_checksum]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
+    Mutant(
+        name="accept_generation_three",
+        source=SAVE_FORMAT,
+        before=GENERATION_GATE,
+        after=GENERATION_GATE.replace(
+            "SAVE_GENERATION_VERSION)",
+            "SAVE_GENERATION_VERSION && r.tool_version != 3u)",
+        ),
+        build_target="optimized_test",
+        test=(
+            "tests/test_cuda.py::test_native_contract"
+            "[save_generation_property]"
+        ),
+        executable_variable="CUDA_TEST_EXE",
+    ),
 ]
 
 
@@ -318,6 +360,78 @@ NEGATIVE_CONTROL = Mutant(
     test="tests/test_cuda.py::test_native_contract[save_roundtrip]",
     executable_variable="CUDA_TEST_EXE",
 )
+
+
+# A real, divergent mutant whose named killing test does not exist. pytest
+# exits 4 without running anything; the driver must report a runner error,
+# never a kill.
+RUNNER_CONTROL = Mutant(
+    name="runner_error_control",
+    source=SAVE_FORMAT,
+    before=GENERATION_GATE,
+    after=GENERATION_GATE.replace("!=", "=="),
+    build_target="optimized_test",
+    test="tests/test_cuda.py::test_native_contract[no_such_contract]",
+    executable_variable="CUDA_TEST_EXE",
+)
+
+# Exit codes: every mutant killed; a mutant survived; a build or test run
+# failed for any other reason, so the result is unknown.
+EXIT_ALL_KILLED = 0
+EXIT_SURVIVOR = 1
+EXIT_RUNNER_ERROR = 2
+
+
+def junit_identity(test):
+    """Map a pytest node ID to its JUnit (classname, name) pair."""
+    path, *parts = test.split("::")
+    module = path.removesuffix(".py").replace("/", ".")
+    return ".".join([module, *parts[:-1]]), parts[-1]
+
+
+def classify_test(returncode, junit_text, test):
+    """Return "killed" or "survived" from one pytest run, else raise.
+
+    A kill is exit 1 with the named test failing in the JUnit report; a
+    survivor is exit 0 with it passing. Anything else means the test did not
+    run as asked, so the result is unknown.
+    """
+    if returncode not in (0, 1):
+        raise RuntimeError(f"pytest exited {returncode}")
+    if junit_text is None:
+        raise RuntimeError("pytest wrote no JUnit report")
+    try:
+        root = ElementTree.fromstring(junit_text)
+    except ElementTree.ParseError as error:
+        raise RuntimeError(f"unreadable JUnit report: {error}") from error
+    cases = list(root.iter("testcase"))
+    if len(cases) != 1:
+        raise RuntimeError(f"expected one test case, found {len(cases)}")
+    case = cases[0]
+    if (case.get("classname"), case.get("name")) != junit_identity(test):
+        raise RuntimeError(
+            f"ran {case.get('classname')}::{case.get('name')}, not {test}"
+        )
+    outcomes = {child.tag for child in case} & {"failure", "error", "skipped"}
+    if outcomes - {"failure"}:
+        raise RuntimeError(f"test did not run cleanly: {sorted(outcomes)}")
+    failed = "failure" in outcomes
+    if failed != (returncode == 1):
+        raise RuntimeError(
+            f"pytest exited {returncode} but the test "
+            f"{'failed' if failed else 'passed'}"
+        )
+    return "killed" if failed else "survived"
+
+
+def exit_code(results):
+    """Return the driver exit code for a list of mutant results."""
+    statuses = {item["status"] for item in results}
+    if statuses - {"killed", "survived"}:
+        return EXIT_RUNNER_ERROR
+    if "survived" in statuses:
+        return EXIT_SURVIVOR
+    return EXIT_ALL_KILLED
 
 
 def sha256(data):
@@ -414,7 +528,11 @@ def run_mutant(mutant):
             return result
 
         environment[mutant.executable_variable] = str(executable)
-        pytest_temp = REPORT_DIR / f"pytest-{mutant.name}"
+        # A fresh directory per run: pytest must clear --basetemp first, and a
+        # stale one it cannot delete turns the run into a setup error.
+        pytest_temp = REPORT_DIR / f"pytest-{mutant.name}-{uuid.uuid4().hex[:8]}"
+        junit = REPORT_DIR / f"{mutant.name}-junit.xml"
+        junit.unlink(missing_ok=True)
         test_command = [
             sys.executable,
             "-m",
@@ -422,6 +540,7 @@ def run_mutant(mutant):
             mutant.test,
             "-q",
             f"--basetemp={pytest_temp}",
+            f"--junitxml={junit}",
         ]
         test = run_command(
             test_command,
@@ -429,7 +548,16 @@ def run_mutant(mutant):
             REPORT_DIR / f"{mutant.name}-test.txt",
         )
         result["test_exit_code"] = test.returncode
-        result["status"] = "killed" if test.returncode != 0 else "survived"
+        junit_text = (
+            junit.read_text(encoding="utf-8") if junit.exists() else None
+        )
+        try:
+            result["status"] = classify_test(
+                test.returncode, junit_text, mutant.test
+            )
+        except RuntimeError as error:
+            result["status"] = "runner_error"
+            result["runner_error"] = str(error)
         return result
     finally:
         for path, data in originals.items():
@@ -442,12 +570,17 @@ def run_mutant(mutant):
 
 
 def main():
-    """Run all required mutants or the known-survivor negative control."""
+    """Run the required mutants, or one of the two driver controls."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--negative-control",
         action="store_true",
         help="prove the driver fails when a mutant survives",
+    )
+    parser.add_argument(
+        "--runner-control",
+        action="store_true",
+        help="prove the driver fails when the killing test never runs",
     )
     parser.add_argument(
         "--only",
@@ -456,7 +589,13 @@ def main():
         help="run only the named mutant; repeat to select several",
     )
     arguments = parser.parse_args()
-    selected = [NEGATIVE_CONTROL] if arguments.negative_control else MUTANTS
+    if arguments.negative_control and arguments.runner_control:
+        parser.error("choose one control")
+    selected = MUTANTS
+    if arguments.negative_control:
+        selected = [NEGATIVE_CONTROL]
+    if arguments.runner_control:
+        selected = [RUNNER_CONTROL]
     if arguments.only:
         known = {mutant.name: mutant for mutant in MUTANTS}
         unknown = sorted(set(arguments.only) - set(known))
@@ -466,12 +605,15 @@ def main():
     results = [run_mutant(mutant) for mutant in selected]
     if arguments.negative_control:
         report_name = "mutation-negative-control.json"
+    elif arguments.runner_control:
+        report_name = "mutation-runner-control.json"
     elif arguments.only:
         report_name = "mutation-selected.json"
     else:
         report_name = "mutation-report.json"
     report = {
         "negative_control": arguments.negative_control,
+        "runner_control": arguments.runner_control,
         "results": results,
         "killed": sum(item["status"] == "killed" for item in results),
         "total": len(results),
@@ -487,9 +629,9 @@ def main():
             f"test={item.get('test_exit_code')}, "
             f"restored={item['restored']})"
         )
-    if any(item["status"] != "killed" for item in results):
-        return 1
-    return 0
+        if "runner_error" in item:
+            print(f"  runner error: {item['runner_error']}")
+    return exit_code(results)
 
 
 if __name__ == "__main__":

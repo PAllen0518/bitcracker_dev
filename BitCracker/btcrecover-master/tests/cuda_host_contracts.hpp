@@ -1197,6 +1197,22 @@ static void save_generation_order_contract() {
             "generation mismatch was not reported before the token-list mismatch");
 }
 
+// F5: the generation field is only trustworthy once the bytes are intact. A
+// corrupt record that also carries another generation reports Corrupt.
+static void save_generation_after_checksum_contract() {
+    uint8_t th[32], wh[32], yh[32];
+    label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
+    SaveRecordV1 r;
+    build_record_v1(r, "t", "w", ' ', th, wh, yh, 0, 100, 0, 0, 0);
+    r.tool_version = SAVE_GENERATION_VERSION + 2;
+    finalize_record_checksum(r);
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::Generation,
+            "sealed record with another generation was not refused as Generation");
+    r.combo_idx ^= 1;                 // corrupt the body; checksum now stale
+    require(validate_save(r, th, wh, ' ', yh, 100) == SaveMismatch::Corrupt,
+            "corruption was not reported before the generation mismatch");
+}
+
 // F3: every existing on-disk v1 save carries tool_version == 1. Shipping with
 // SAVE_GENERATION_VERSION == 1 must let those saves resume with no migration.
 static void save_generation_migrate_v1_contract() {
@@ -1234,14 +1250,17 @@ static void save_generation_no_override_contract() {
     }
 }
 
-// F4 property (Amendment 1, A3): explicit boundary values, then seeded random
-// ones. Only the build's own value resumes; every other value refuses.
+// F4 property (Amendment 1, A3): every value up to 65535, where real version
+// numbers live, then boundary values and seeded random ones across the rest.
+// Only the build's own value resumes; every other value refuses.
 static void save_generation_property_contract() {
     uint8_t th[32], wh[32], yh[32];
     label_hash("tok", th); label_hash("wal", wh); label_hash("typ", yh);
-    std::vector<uint32_t> values = {
-        SAVE_GENERATION_VERSION, 0u, SAVE_GENERATION_VERSION - 1u,
-        SAVE_GENERATION_VERSION + 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu};
+    std::vector<uint32_t> values;
+    for (uint32_t v = 0; v <= 0xffffu; ++v) values.push_back(v);
+    values.insert(values.end(), {
+        SAVE_GENERATION_VERSION - 1u, SAVE_GENERATION_VERSION + 1u,
+        0x7fffffffu, 0x80000000u, 0xffffffffu});
     std::mt19937_64 generator(20261003);
     for (int i = 0; i < 4096; ++i) {
         values.push_back(static_cast<uint32_t>(generator()));
@@ -1416,6 +1435,8 @@ static int run_host_contract(const std::string& name) {
     else if (name == "save_rebind_roundtrip") save_rebind_roundtrip_contract();
     else if (name == "save_reject_generation") save_reject_generation_contract();
     else if (name == "save_generation_order") save_generation_order_contract();
+    else if (name == "save_generation_after_checksum")
+        save_generation_after_checksum_contract();
     else if (name == "save_generation_migrate_v1")
         save_generation_migrate_v1_contract();
     else if (name == "save_generation_no_override")

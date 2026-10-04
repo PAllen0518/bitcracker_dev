@@ -100,7 +100,8 @@ not gamed.
 pre-existing gates still kill after the `SaveMismatch` enum gained `Generation`,
 confirming no regression from the enum change. Driver fails closed
 (`py -3.10 tools/validate_save_format.py --negative-control` is the harness's own
-survivor control, unchanged by this work).
+survivor control, unchanged by this work). **[Superseded: the driver did not fail
+closed on pytest errors; see "Verifier Round 2 corrections" below.]**
 
 ## Gauntlet layers
 
@@ -255,7 +256,7 @@ the set of cases hashed. `master` had no pin table, so this is the bootstrap row
 | `pytest tests/test_cuda.py tests/test_cuda_cli.py tests/test_generation_pins.py` | **151 passed** (134 + 2 contracts + 1 CLI + 14 pin tests) |
 | `pytest tests` | **198 passed** (verifier saw 181 at `b093dc8`; +17 new) |
 | ruff (4 files, line length 100) | all passed |
-| `validate_save_format.py` | **15/15 killed**, all `restored=True` |
+| `validate_save_format.py` | **15/15 killed**, all `restored=True` **[Superseded: most likely 14 real kills; `drop_migration_backup_abort` errored in setup. See "Verifier Round 2 corrections".]** |
 | `--negative-control` | survivor survived, exit 1 as designed |
 | Tree after run | only the intended edits; no mutant bytes left |
 
@@ -290,4 +291,106 @@ by one; (2) run `save_generation_canary`, which prints the new fingerprint; (3)
 row: `test_generation_pins.py` fails if you do.
 
 Status: corrections complete in the worktree, uncommitted. Committed-source
-gauntlet and verifier Round 2 are pending.
+gauntlet and verifier Round 2 are pending. **[Superseded: Paul committed these as
+`a8d3d5d`; handoff 31 recorded the committed-source run; Round 2 then failed. See
+below.]**
+
+## Verifier Round 2 corrections (2026-10-03)
+
+### Round 2 outcome (recorded, not rewritten)
+
+Codex's verifier Round 2 **failed** (`docs/handoffs/2026-10-03-32-codex.md`). It
+reviewed candidate `a8d3d5d` at HEAD `60378bd` (handoff 31 on top), under Python
+3.14.6. Its own runs reproduced both builds, 198 passed, 15/15 required mutants
+with real test failures, ruff, and the survivor control. It found the runtime gate
+correct and the Amendment 1 corrections satisfied. Findings, graded by Paul
+("Accepted as proposed"):
+
+- **R2-F1 (blocker):** the mutation driver counted any nonzero pytest exit as a
+  kill. A real mutant pointed at a nonexistent test (pytest exit 4) was reported
+  killed and the driver exited 0. The claim "Driver fails closed" was false.
+- **R2-F2:** no test combined a corrupt checksum with a generation mismatch, so
+  moving the generation check ahead of the checksum check passed all tests.
+- **R2-F3:** the fixed and random generation values missed `3`; a mutant also
+  accepting `3` passed all tests.
+- **R2-F4:** under shuffled test order, the agent-workspace backup test failed
+  (`WinError 5` at `os.replace`). That code is unchanged since `a2f171f`. Paul
+  graded it out of scope for this branch; it is tracked separately and not fixed here.
+
+Paul has authorized further verifier rounds until one passes.
+
+### What changed
+
+| Finding | Change | Test / control |
+|---|---|---|
+| R2-F1 | Kill only when pytest exits 1 **and** its JUnit report shows the named test ran and failed; exit 0 with it passing is a survivor; anything else is a runner error. Driver exits 0 all killed, 1 survivor, 2 runner error. | `tests/test_mutation_driver.py` (20 cases); `--runner-control` end-to-end |
+| R2-F1 (found while fixing) | Fresh pytest temp directory per mutant run | `drop_migration_backup_abort` rerun |
+| R2-F2 | `save_generation_after_checksum`: sealed record with another generation → `Generation`; same record with a stale checksum → `Corrupt` | `generation_before_checksum` mutant |
+| R2-F3 | Property tests every value 0..65535, plus boundaries and the 4,096 seeded values (0.86 s) | `accept_generation_three` mutant |
+
+No product code changed: `save_format.hpp`, `multibit_cuda_threads.cu` and
+`cuda_typos.hpp` are still byte-identical to `b093dc8`.
+
+### A false kill found in my own runs (disclosed)
+
+On its first full run, the fixed driver reported `drop_migration_backup_abort` as a
+**runner error**. Pytest could not clear that mutant's leftover temp directory
+(`Access is denied`, even when reading its permissions), so the test errored in
+setup and never ran. The old driver counted that error as a kill.
+
+The directory was created at 13:43. That is after my 13:27 committed-source run of
+`b093dc8` and during Codex's Round 1 work in this worktree. No process holds it.
+So the two later builder runs, the 16:08 worktree run and the 16:26 committed-source
+run of `a8d3d5d`, **most likely** had 14 real kills, not the 15/15 reported. Their
+per-mutant logs were overwritten, so this can't be confirmed for those runs; the
+cause was in place for both. Codex's Round 2 kills ran in a separate copy and are
+unaffected. The driver now uses a fresh temp directory per run. Rerun alone, the
+mutant is a real kill (JUnit `failure`). The locked directory was left in place:
+removing it needs admin ownership changes, and it sits in ignored scratch space.
+
+### RED → GREEN
+
+| Check | RED | GREEN |
+|---|---|---|
+| R2-F1 unit | stub with the old rule: **15 failed**, 5 passed (`red-r2f1-driver-unit.log`) | 20/20 passed |
+| R2-F1 end-to-end | old rule: `runner_error_control` reported **killed** (pytest exit 4), driver exit 0 (`red-r2-end-to-end.log`) | `runner_error`, exit 2 |
+| R2-F2 | `generation_before_checksum` "killed" only by pytest exit 4: its test did not exist yet (same log) | killed by a real failure |
+| R2-F3 | `accept_generation_three` **survived** (same log) | killed |
+
+### Gauntlet after the last edit (uncommitted worktree, base `60378bd`)
+
+Log `.cuda-build/r2fix-gauntlet2.log` (git-ignored):
+
+| Layer | Result |
+|---|---|
+| Builds | `optimized_test` and `optimized` rc 0; 0 warning mentions in saved build output |
+| `pytest tests` | **219 passed** (198 + 20 driver unit tests + 1 contract) |
+| ruff (5 files, line length 100) | all passed |
+| `validate_save_format.py` | **17/17 required mutants killed**, each by its named test running and failing; exit 0 |
+| `--negative-control` (separate) | survivor survived, exit 1 as designed |
+| `--runner-control` (separate) | runner error (pytest exit 4), exit 2 as designed |
+| Sources | all 19 runs `restored=True`; tree after shows only the intended edits |
+
+### Claims now, and their limits
+
+- **Driver:** a required mutant counts as killed only when its named test ran and
+  failed. Usage errors, nothing collected, interruptions, setup errors, skips, a
+  different test, or a missing or unreadable report all fail the run.
+- **Generation values:** every value 0..65535 is checked exhaustively; the rest of
+  the 32-bit range is sampled.
+- **Pin protection:** prefix protection becomes useful once the bootstrap pin is in
+  integration history. `master` has no pins yet.
+- Runtimes: builder runs used Python 3.10.3; Codex used 3.14.6. Neither
+  reproduced the other's runtime.
+- Not run: thresholded C++ coverage, sanitizers, and a passing shuffled-order suite
+  (the shuffled failure is R2-F4, out of scope).
+
+### Reproduce (from `BitCracker/btcrecover-master`)
+
+1. `python tools/build_cuda.py optimized_test` and `python tools/build_cuda.py optimized`
+2. `py -3.10 -m pytest tests -q`
+3. `py -3.10 tools/validate_save_format.py` (expect exit 0), `--negative-control`
+   (expect 1), `--runner-control` (expect 2)
+4. `py -3.10 -m ruff check tests/test_cuda.py tests/test_cuda_cli.py tests/test_generation_pins.py tests/test_mutation_driver.py tools/validate_save_format.py --line-length 100`
+
+Status: Round 2 corrections complete in the worktree, uncommitted.
