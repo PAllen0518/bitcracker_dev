@@ -37,6 +37,7 @@ class Mutant:
     test: str
     executable_variable: str
     extra_edits: tuple = ()
+    report_fault: bool = False  # corrupt the JUnit root (report control only)
 
     def edits(self):
         """Return every edit, the primary one first."""
@@ -375,6 +376,28 @@ RUNNER_CONTROL = Mutant(
     executable_variable="CUDA_TEST_EXE",
 )
 
+# A real, divergent mutant whose named test genuinely runs and fails, but whose
+# JUnit report root is then corrupted. A report the driver does not recognize
+# must be a runner error, never a kill.
+REPORT_CONTROL = Mutant(
+    name="report_error_control",
+    source=SAVE_FORMAT,
+    before=GENERATION_GATE,
+    after=GENERATION_GATE.replace("!=", "=="),
+    build_target="optimized_test",
+    test="tests/test_cuda.py::test_native_contract[save_reject_generation]",
+    executable_variable="CUDA_TEST_EXE",
+    report_fault=True,
+)
+
+
+def corrupt_report_root(junit_text):
+    """Rename the JUnit root element, leaving every test case intact."""
+    root = ElementTree.fromstring(junit_text)
+    root.tag = "not_junit"
+    return ElementTree.tostring(root, encoding="unicode")
+
+
 # Exit codes: every mutant killed; a mutant survived; a build or test run
 # failed for any other reason, so the result is unknown.
 EXIT_ALL_KILLED = 0
@@ -387,6 +410,40 @@ def junit_identity(test):
     path, *parts = test.split("::")
     module = path.removesuffix(".py").replace("/", ".")
     return ".".join([module, *parts[:-1]]), parts[-1]
+
+
+# The pytest JUnit layout this driver accepts. Anything else is unknown.
+OUTCOME_TAGS = {"failure", "error", "skipped"}
+OUTPUT_TAGS = {"properties", "system-out", "system-err"}
+
+
+def report_testcase(root):
+    """Return the single test case of a pytest JUnit report, else raise.
+
+    Accepted: <testsuites> holding one <testsuite>, or a bare <testsuite>.
+    The suite holds exactly one <testcase> plus optional output elements, and
+    the case holds only outcome and output elements.
+    """
+    suite = root
+    if root.tag == "testsuites":
+        children = list(root)
+        if len(children) != 1 or children[0].tag != "testsuite":
+            raise RuntimeError(
+                "JUnit <testsuites> must hold exactly one <testsuite>"
+            )
+        suite = children[0]
+    elif root.tag != "testsuite":
+        raise RuntimeError(f"not a JUnit report: root is <{root.tag}>")
+    unknown = {child.tag for child in suite} - {"testcase"} - OUTPUT_TAGS
+    if unknown:
+        raise RuntimeError(f"unexpected JUnit suite content: {sorted(unknown)}")
+    cases = [child for child in suite if child.tag == "testcase"]
+    if len(cases) != 1:
+        raise RuntimeError(f"expected one test case, found {len(cases)}")
+    unknown = {child.tag for child in cases[0]} - OUTCOME_TAGS - OUTPUT_TAGS
+    if unknown:
+        raise RuntimeError(f"unexpected JUnit test content: {sorted(unknown)}")
+    return cases[0]
 
 
 def classify_test(returncode, junit_text, test):
@@ -404,18 +461,17 @@ def classify_test(returncode, junit_text, test):
         root = ElementTree.fromstring(junit_text)
     except ElementTree.ParseError as error:
         raise RuntimeError(f"unreadable JUnit report: {error}") from error
-    cases = list(root.iter("testcase"))
-    if len(cases) != 1:
-        raise RuntimeError(f"expected one test case, found {len(cases)}")
-    case = cases[0]
+    case = report_testcase(root)
     if (case.get("classname"), case.get("name")) != junit_identity(test):
         raise RuntimeError(
             f"ran {case.get('classname')}::{case.get('name')}, not {test}"
         )
-    outcomes = {child.tag for child in case} & {"failure", "error", "skipped"}
-    if outcomes - {"failure"}:
-        raise RuntimeError(f"test did not run cleanly: {sorted(outcomes)}")
-    failed = "failure" in outcomes
+    outcomes = [child.tag for child in case if child.tag in OUTCOME_TAGS]
+    if len(outcomes) > 1:
+        raise RuntimeError(f"test has several outcomes: {outcomes}")
+    if outcomes and outcomes[0] != "failure":
+        raise RuntimeError(f"test did not run cleanly: {outcomes}")
+    failed = outcomes == ["failure"]
     if failed != (returncode == 1):
         raise RuntimeError(
             f"pytest exited {returncode} but the test "
@@ -551,6 +607,9 @@ def run_mutant(mutant):
         junit_text = (
             junit.read_text(encoding="utf-8") if junit.exists() else None
         )
+        if mutant.report_fault and junit_text is not None:
+            junit_text = corrupt_report_root(junit_text)
+            result["report_fault"] = "JUnit root renamed to not_junit"
         try:
             result["status"] = classify_test(
                 test.returncode, junit_text, mutant.test
@@ -570,7 +629,7 @@ def run_mutant(mutant):
 
 
 def main():
-    """Run the required mutants, or one of the two driver controls."""
+    """Run the required mutants, a selection of them, or one driver control."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--negative-control",
@@ -583,19 +642,34 @@ def main():
         help="prove the driver fails when the killing test never runs",
     )
     parser.add_argument(
+        "--report-control",
+        action="store_true",
+        help="prove the driver fails on a test report it does not recognize",
+    )
+    parser.add_argument(
         "--only",
         action="append",
         metavar="NAME",
         help="run only the named mutant; repeat to select several",
     )
     arguments = parser.parse_args()
-    if arguments.negative_control and arguments.runner_control:
-        parser.error("choose one control")
+    modes = [
+        flag for flag, chosen in (
+            ("--negative-control", arguments.negative_control),
+            ("--runner-control", arguments.runner_control),
+            ("--report-control", arguments.report_control),
+            ("--only", bool(arguments.only)),
+        ) if chosen
+    ]
+    if len(modes) > 1:
+        parser.error(f"choose one of: {', '.join(modes)}")
     selected = MUTANTS
     if arguments.negative_control:
         selected = [NEGATIVE_CONTROL]
     if arguments.runner_control:
         selected = [RUNNER_CONTROL]
+    if arguments.report_control:
+        selected = [REPORT_CONTROL]
     if arguments.only:
         known = {mutant.name: mutant for mutant in MUTANTS}
         unknown = sorted(set(arguments.only) - set(known))
@@ -607,6 +681,8 @@ def main():
         report_name = "mutation-negative-control.json"
     elif arguments.runner_control:
         report_name = "mutation-runner-control.json"
+    elif arguments.report_control:
+        report_name = "mutation-report-control.json"
     elif arguments.only:
         report_name = "mutation-selected.json"
     else:
@@ -614,6 +690,7 @@ def main():
     report = {
         "negative_control": arguments.negative_control,
         "runner_control": arguments.runner_control,
+        "report_control": arguments.report_control,
         "results": results,
         "killed": sum(item["status"] == "killed" for item in results),
         "total": len(results),

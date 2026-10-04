@@ -263,7 +263,9 @@ the set of cases hashed. `master` had no pin table, so this is the bootstrap row
 ### Claims now, and their limits
 
 - **F2:** a forgotten bump makes the branch's suite fail. The canary drifts on any
-  order change in the hashed cases, and the only way back to green is a new row
+  order change in the hashed cases **[Qualified in Round 3: the canary hashes the
+  reference generator; live-generator changes are caught by the separate
+  live-vs-reference tests, not by the canary]**, and the only way back to green is a new row
   plus a version bump. This does not stop a deliberate edit of the checker, or an
   edit committed straight to `master` (where merge-base equals HEAD). It catches
   an honest mistake.
@@ -376,6 +378,8 @@ Log `.cuda-build/r2fix-gauntlet2.log` (git-ignored):
 - **Driver:** a required mutant counts as killed only when its named test ran and
   failed. Usage errors, nothing collected, interruptions, setup errors, skips, a
   different test, or a missing or unreadable report all fail the run.
+  **[Superseded: a parseable report with an unrecognized structure was still
+  classified. See "Verifier Round 3 corrections".]**
 - **Generation values:** every value 0..65535 is checked exhaustively; the rest of
   the 32-bit range is sampled.
 - **Pin protection:** prefix protection becomes useful once the bootstrap pin is in
@@ -393,4 +397,105 @@ Log `.cuda-build/r2fix-gauntlet2.log` (git-ignored):
    (expect 1), `--runner-control` (expect 2)
 4. `py -3.10 -m ruff check tests/test_cuda.py tests/test_cuda_cli.py tests/test_generation_pins.py tests/test_mutation_driver.py tools/validate_save_format.py --line-length 100`
 
-Status: Round 2 corrections complete in the worktree, uncommitted.
+Status: Round 2 corrections complete in the worktree, uncommitted. **[Superseded:
+Paul committed these as `dcb3b2a`; handoff 33 recorded the committed-source run;
+Round 3 then failed. See below.]**
+
+## Verifier Round 3 corrections (2026-10-03)
+
+### Round 3 outcome (recorded, not rewritten)
+
+Codex's verifier Round 3 **failed** (`docs/handoffs/2026-10-03-34-codex.md`). It
+reviewed candidate `dcb3b2a` at HEAD `f59a978` (handoff 33 on top), under Python
+3.14.6 and Ruff 0.16.0. It reproduced both builds, 219 passed with no skips, 17/17
+required kills (each checked against its named JUnit test case), and all three
+controls, and found the runtime gate correct. Findings, graded by Paul ("accept
+as proposed"):
+
+- **R3-B1 (blocker):** the driver checked only that the report was parseable XML
+  with a matching test case. Codex let a real mutant's named test fail, then
+  renamed the JUnit root to `not_junit`. The driver still reported a kill and
+  exited 0. Unknown elements inside a test case read as a pass, and duplicate
+  failure elements were merged into one.
+- **R3-B2:** `--only` silently replaced a requested control.
+  `--negative-control --only drop_generation_check` ran a required mutant, exited
+  0, and labelled the report as the negative control.
+- **R3-G1 (lint only):** the five-file Ruff command passed under my Ruff 0.15.18
+  but failed under 0.16.0 (RUF100: unused `# noqa: E402`). Both results were
+  accurate for their versions.
+- **Canary wording:** the canary hashes the reference generator only. Codex's
+  live-only repeat/delete reorder survived the canary but failed 4 of the
+  live-vs-reference tests. It is not a forgotten-bump survivor of the full suite,
+  but the evidence implied the canary covered both layers.
+
+### What changed
+
+| Finding | Change | Test / control |
+|---|---|---|
+| R3-B1 | `report_testcase` accepts only the pytest JUnit layout: `<testsuites>` holding one `<testsuite>`, or a bare `<testsuite>`; one `<testcase>`; only outcome (`failure`, `error`, `skipped`) and output (`properties`, `system-out`, `system-err`) elements; at most one outcome. Anything else is a runner error. | 7 structure cases plus 4 accepted-layout cases in `tests/test_mutation_driver.py`; end-to-end `--report-control` |
+| R3-B2 | `--negative-control`, `--runner-control`, `--report-control` and `--only` are mutually exclusive; any combination stops at argument parsing before anything runs | 6 combination cases (no CUDA build) |
+| R3-G1 | `from tools import validate_save_format` (conftest already puts the project root on the path); no path insert, no `noqa` | Ruff 0.15.18 default rules plus `--extend-select RUF100,E402` |
+
+`--report-control` builds a real mutant whose named test genuinely runs and fails
+(the on-disk report shows `failure`), then corrupts the report root before
+classification. The fault hook applies only to that control mutant.
+
+No product code changed: `save_format.hpp`, `multibit_cuda_threads.cu` and
+`cuda_typos.hpp` are still byte-identical to `b093dc8`.
+
+### RED → GREEN
+
+| Check | RED (old classifier and argument rules) | GREEN |
+|---|---|---|
+| Driver unit tests | **11 failed**, 27 passed (`red-r3-driver-unit.log`): wrong root, nested suite, unknown child on pass and fail, duplicate failure, 5 control combinations, report fault | 38/38 passed |
+| `--report-control` end to end | reported **killed**, exit 0 (`red-r3-report-control.log`) | runner error "not a JUnit report: root is <not_junit>", exit 2 |
+| Control plus `--only` | ran the required mutant, exit 0 (`red-r3-control-combo.log`) | argparse error, exit 2, nothing run |
+
+Two structure cases already failed closed before the fix (two outcomes; a failure
+nested inside `system-out`). They are kept as regressions.
+
+### Gauntlet after the last edit (uncommitted worktree, base `f59a978`)
+
+Log `.cuda-build/r3fix-gauntlet.log` (git-ignored). Python 3.10.3, Ruff 0.15.18.
+
+| Layer | Result |
+|---|---|
+| Builds | `optimized_test` and `optimized` rc 0; 0 warning mentions |
+| `pytest tests` | **237 passed** (219 + 18 new driver cases) |
+| Ruff, 5 files, line length 100 | all passed |
+| Ruff `--extend-select RUF100,E402` on the changed test | all passed |
+| `validate_save_format.py` | **17/17 required mutants killed**, exit 0 |
+| `--negative-control` | survivor survived, exit 1 |
+| `--runner-control` | runner error (pytest exit 4), exit 2 |
+| `--report-control` | runner error (unrecognized report root), exit 2 |
+| `--negative-control --only …` | rejected at parsing, exit 2, nothing run |
+| Sources | all 20 runs `restored=True`; tree after shows only the intended edits |
+
+### Claims now, and their limits
+
+- **Driver:** a required mutant counts as killed only when its named test ran and
+  failed, in a report with the recognized pytest JUnit layout. Every other outcome
+  or layout is a runner error (exit 2). Controls run only on their own.
+- **Two detection layers for order changes:** the canary fingerprints the
+  reference generator, and the live-vs-reference tests (`assembly`, `resume`,
+  `parallel` and the typo comparisons) catch live-generator changes that
+  the reference does not share. Both must hold; neither alone covers both.
+- **Lint:** verified here under Ruff 0.15.18 only, with RUF100 and E402 explicitly
+  enabled. Ruff 0.16.0 was not installed here (no installs authorized); the next
+  verifier run checks it.
+- Runtimes: builder Python 3.10.3 / Ruff 0.15.18; Codex Python 3.14.6 / Ruff 0.16.0.
+- Unchanged limits: honest-branch bump enforcement; pin prefix protection is useful
+  only once the bootstrap pin is in integration history; values above 65,535
+  sampled; `SAVE_FORMAT_VERSION` constant indistinguishable at generation 1; no
+  thresholded C++ coverage, sanitizers, or full shuffled-order pass (R2-F4 out of
+  scope). The uncertainty about my overwritten 16:08 and 16:26 logs stands.
+
+### Reproduce (from `BitCracker/btcrecover-master`)
+
+1. `python tools/build_cuda.py optimized_test` and `python tools/build_cuda.py optimized`
+2. `py -3.10 -m pytest tests -q`
+3. `py -3.10 tools/validate_save_format.py` (expect 0), then separately
+   `--negative-control` (1), `--runner-control` (2), `--report-control` (2)
+4. `py -3.10 -m ruff check tests/test_cuda.py tests/test_cuda_cli.py tests/test_generation_pins.py tests/test_mutation_driver.py tools/validate_save_format.py --line-length 100`
+
+Status: Round 3 corrections complete in the worktree, uncommitted.
