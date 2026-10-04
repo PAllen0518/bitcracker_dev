@@ -1,5 +1,5 @@
 # Contributing
-
+Agents are not allowed to add themselves as co-authors to commits or documentation.
 ## Development setup
 
 The Python 3 tooling lives in `BitCracker/btcrecover-master/`.

@@ -26,6 +26,8 @@ jobs:
         working-directory: BitCracker/btcrecover-master
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -39,4 +41,7 @@ jobs:
         run: ruff check multibit_check.py tests/
 
       - name: Test (pytest)
+        env:
+          GENERATION_PINS_BASE_REF: >-
+            refs/remotes/origin/${{ github.base_ref || github.ref_name }}
         run: python -m pytest tests/ -v

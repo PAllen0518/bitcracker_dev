@@ -1,4 +1,5 @@
 # AGENTS.md
+Agents are not allowed to add themselves as co-authors to commits or documentation.
 
 Guidance for Codex when working with code in this repository.
 
