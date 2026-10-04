@@ -2,12 +2,17 @@
 
 ## Current checkpoint, 2026-10-04 UTC
 
-The current fix is an **uncommitted working-tree candidate**, based on
-`c996a00d506a67dc1188e849fe451604b8c46944`. Its underlying reviewed code
-was `344c40acb2ee5cc4416d98cbe1923d980df3fec3`. Local validation appears
-in the final section below. Earlier results are historical, not certification
-of these working bytes. Round 4 failed despite its passing standard gauntlet.
-Fresh blind verification, commit, merge and shared-database setup are pending.
+Paul committed the candidate as
+`6cb35e838d997e339ec4ccdc1dcd51853fbb7dce`. Fresh committed-source results
+and documentary corrections appear in the final section below. The earlier
+working candidate was based on `c996a00d506a67dc1188e849fe451604b8c46944`,
+whose underlying reviewed code was
+`344c40acb2ee5cc4416d98cbe1923d980df3fec3`. Earlier results are historical.
+Round 4 failed despite its passing standard gauntlet. Round 5's final Phase 2
+verdict is bounded PASS for the approved contract at `6cb35e8`. Paul approved
+closure under the existing named-test-failure rule on 2026-10-04. Its
+stricter-input Phase 1 FAIL remains frozen and explicit. Merge and
+shared-database setup remain unauthorized.
 
 Companion to `GENERATION_BINDING_SPEC.md` (approved, gate 1 cleared 2026-09-27).
 Loop: Old Coder. Risk tier 3. This report is written so the change can be trusted
@@ -592,7 +597,10 @@ worktree. This is local builder validation, not fresh independent verification.
    accepted both cases. Requiring both controls and successful restoration
    made these tests pass.
 3. Focused GREEN is **149 passed**, comprising 135 driver tests and 14 pin
-   tests, under Python 3.14.6 / pytest 9.0.3 and Python 3.10.3 / pytest 9.0.2.
+   tests, under Python 3.14.6 and Python 3.10.3. The archived primary pytest
+   version is 8.4.1. Prior labels "9.0.3" and "9.0.2" were incorrect and
+   have been withdrawn; the archived runner did not record pytest310's
+   version separately. Current versions are recorded in the follow-up below.
    The 72 generated XML shapes exercise suite and testcase contexts, three
    containers, four hidden tags, depths 0/1/3, and both pytest exits 0/1.
    Positive tests preserve text, properties, escaped markup and CDATA,
@@ -603,7 +611,7 @@ worktree. This is local builder validation, not fresh independent verification.
    output, and accepting partial controls with `any`. No production source
    was mutated for these probes. This is a separate **4/4** checker sweep,
    not part of the required 17 native mutants.
-5. Coverage.py 7.13.5 measured **10/10 executable lines** across
+5. Coverage.py measured **10/10 executable lines** across
    `check_report_leaf` and `report_control_exit`. This is a narrow line gate,
    not 100% whole-driver, native, branch or repository coverage.
 6. Ruff 0.16.0 and 0.15.18 both passed on the six scoped Python files, using
@@ -637,8 +645,16 @@ Actual fresh run artifacts: `.cuda-build/binding-all-72de1a55/`.
 Every subprocess has an individual `.json` command/exit record and `.log`.
 The suite has JUnit XML; helper coverage and source-copy hashes are retained.
 The runner fails on unexpected command exits, wrong mutant/control results,
-missing controls, absent genuine assertion failures or restoration mismatch.
+missing controls, absent matching named-test failures or restoration mismatch.
 Native mutations operate only on an allowlisted copy under `.cuda-build`.
+The classifier does not enforce Python exception type: a valid named
+call-phase RuntimeError or TimeoutExpired failure can also count as killed.
+The default full-suite baseline passes before the mutation sweep, but
+`run_mutant` alone does not prove the same test passed on the baseline.
+All 17 official kills in this independent run were separately confirmed to
+contain actual assertion failures. An assertion-only rule or additional
+baseline discrimination would be a new policy requiring human approval,
+not an already-approved requirement or an automatic product correction.
 
 | Layer | Actual result |
 |---|---|
@@ -707,9 +723,224 @@ random fuzz run was performed. The separately human-excluded workspace-backup
 shuffle issue remains out of scope. Earlier independent findings and failed
 rounds remain historical evidence, not erased by local GREEN.
 
-The next mandatory gate is Paul's commit, then a fresh blind verifier against
-that exact clean candidate. Its Phase 1 receives only the approved contract,
+At the local working-tree checkpoint, the next mandatory gate was Paul's
+commit, then a fresh blind verifier against that exact candidate. Paul has
+since committed `6cb35e8`; the committed follow-up is recorded below.
+Phase 1 receives only the approved contract,
 spec, exact source state and replay commands, not this evidence, handoffs or
 prior findings. No new independent verdict exists for this working candidate.
 After the blind report freezes, Phase 2 may inspect the historical evidence.
 There is no authorization to merge or create the external shared database.
+
+## Committed-source follow-up, 2026-10-04 UTC
+
+Source: `6cb35e838d997e339ec4ccdc1dcd51853fbb7dce`, branch
+`worktree-generation-binding`. The approved spec raw SHA-256 is
+`1a9b2c047c47b67b3c83c0e2675ce03460aacc7d98e4d9848c86e8e0c49eead9`.
+The worktree was clean at preflight. The user explicitly approved this fresh
+gauntlet and blind verification and confirmed recovery was not running.
+Read-only process checks found no recovery process. Desktop GPU applications
+were present, so GPU use was not described as zero.
+
+Command from `BitCracker/btcrecover-master`:
+
+```powershell
+python tools/generation_binding_gauntlet.py
+```
+
+Fresh artifacts: `.cuda-build/binding-all-d72b55b6/`. The replay created new
+isolated mutant sources under `.cuda-build/gmabb2/`; no old native artifacts
+were substituted. Before independent execution, the current source was also
+bound to the commit with the persisted read-only check:
+
+```powershell
+python .cuda-build/committed-6cb35e8/check_source_state.py
+```
+
+It verified **69** tracked code/config files in the native root, tests and
+tools against the commit's blobs after LF normalization, while recording
+raw working-file hashes. The file selection intentionally excludes deeper
+upstream packages and is not a whole-repository tree hash. A scratch path
+calculation initially selected the wrong ancestor and failed before checking;
+the corrected check completed and wrote `SOURCE_STATE.json`.
+
+Actual tool versions recorded by subprocess commands in that artifact:
+
+| Tool | Python 3.14 installation | Python 3.10 installation |
+|---|---|---|
+| Python | 3.14.6 | 3.10.3 |
+| pytest | 8.4.1 | 9.1.1 |
+| Ruff | 0.16.0 | 0.15.18 |
+| Coverage.py | 7.15.2 | Not used for coverage |
+
+The committed report incorrectly labeled pytest versions as 9.0.3/9.0.2 and
+Coverage.py as 7.13.5. The primary archived pytest-version log contradicts
+9.0.3; the other historical version labels were unsupported by archived
+version records. Those labels are withdrawn, not silently treated as an
+environment change. This is a documentary tool-metadata correction; no code,
+test, spec, dependency or executed source changed. The corrected draft is
+prepared before the new full independent verifier execution. Historical
+handoffs and frozen artifacts remain unchanged.
+
+| Fresh committed layer | Actual result |
+|---|---|
+| Focused tests | 149 passed on both Python installations |
+| Scoped Ruff | Both versions passed |
+| Helper coverage | 10/10 executable lines, narrow scope only |
+| Separate checker mutants | 4/4 caught by actual assertion failures |
+| Both fresh CUDA builds | Passed, exits 0 |
+| Full suite | 334 passed, exit 0 |
+| Required native mutants | 17/17 killed, build 0, test 1, restored, gate 0 |
+| Survivor negative control | `survived`, build 0, test 0, restored, gate 1 |
+| Runner-error control | `runner_error`, build 0, test 4, restored, gate 2 |
+| Both report controls | `runner_error`, clean `killed`, build 0, test 1, restored, gate 2 |
+| Final restoration | All 18 raw hashes match source and isolated copy |
+
+The full replay completed with exit 0. Native build/test resources were then
+released to the fresh-context verifier. The parent will not build while that
+verifier owns them. Its fresh artifacts and frozen report are separate from
+these builder outputs. No prior evidence, findings or handoffs were given to
+its blind phase.
+
+Draft evidence changes are the only tracked working-file modifications after
+the clean source preflight. They are withheld from the fresh-context verifier
+until Phase 1 freezes. Executable/test/spec state remains the exact committed
+candidate. Before the verifier completed, independent status was **not
+performed**, not inherited from the builder's passing layers or previous
+rounds. The completed source-specific review is recorded below.
+
+## Independent verification, Round 5, 2026-10-04 UTC
+
+Verified executable/test/spec state:
+`6cb35e838d997e339ec4ccdc1dcd51853fbb7dce`.
+
+- Fresh-context verifier: no history fork; same inherited model family.
+  Context correlation was broken, model-family correlation was not.
+- Initial inputs: task contract, approved spec, exact source and the tracked
+  entry point. Builder counts, evidence, handoffs and prior findings were
+  withheld until Phase 1 froze. Native build resources were serialized.
+- Final Phase 2 verdict: **bounded PASS for the approved generation-binding
+  and nested-report correction**. Paul approved closure under the existing
+  named-test-failure rule; the approval context is recorded below. This is
+  not blanket certification or operational approval.
+- Historical Phase 1 verdict: **FAIL under the literal stricter task input**.
+  It was not rewritten after the contract comparison.
+- No code, test or approved-spec behavior changed after the verified state.
+  Only documentary corrections and publication records changed.
+
+Frozen artifacts under
+`.cuda-build/blind-6cb-20261004-35b10f67/`:
+
+| Frozen artifact | Raw SHA-256 |
+|---|---|
+| `PHASE1_FROZEN.md` | `92263caf63afc508c4db60759ee2f879ccc97c5dd2c3d0c82242f2000df21a10` |
+| `PHASE2_FROZEN.md` | `1eb79c59e6d3f18543ae41ac493a146d81ea9046a6a81a7ea76e486ac31b86d2` |
+
+Both hashes were independently checked at publication. The final narrowed
+draft actually compared in Phase 2 had raw SHA-256
+`8d4003dee76c0dc2cde956210e995a0b897f0f91a4226c8cc3f6dd7378e4e236`.
+This final results section is subsequent documentary publication, not a claim
+that the entire newly appended document was hashed during that comparison.
+
+### Executed independent run and attacks
+
+The verifier's persisted `probe.py replay` executed the full tracked entry
+point. Fresh run: `.cuda-build/binding-all-09e5e0c2/`; fresh native mutation
+copy: `.cuda-build/gmfc10/`. Both focused lanes passed 149 tests; the full
+suite passed 334; helper lines were 10/10; all four checker mutants were
+caught. Both CUDA builds passed. All 17 native mutants and all standalone
+controls held, with raw restoration verified.
+
+Additional independently executed attacks:
+
+- 288 invalid descendant report trees rejected; ordinary properties, text,
+  escaped markup and CDATA accepted.
+- Bounded pin histories of lengths 1 through 4, including removal, reversal,
+  historical edits, valid unchanged/appended histories and invalid current
+  rows, produced the expected outcomes.
+- All 11 ambiguous mode combinations refused before builds.
+- 100 real synthetic CLI refusal cases covered five generation values,
+  identity variations, checksum corruption and REBIND/no input. Every refusal
+  preserved raw checkpoint bytes and created no recovery/migration output.
+- Every one of the 17 official kill XML files contained a genuine failing
+  assertion, independently inspected rather than inferred from its status.
+- A separately built divergent generation-gate mutant and a named native
+  timeout test demonstrated that call-phase TimeoutExpired can count as a
+  kill even when the baseline test fails identically. This intentionally
+  failing test was not part of the approved baseline-green test set.
+
+One extra native probe first failed compilation because of nvcc's nested
+temporary-path limit. That attempt was retained as `build_failed`, not a kill;
+the shorter isolated-path rerun built successfully. A version-only `cl /Bv`
+diagnostic returned 2 because no source was supplied. Coverage.py was absent
+in the Python 3.10 installation, whose diagnostic returned 1; no secondary
+coverage layer was claimed or installed. Other limits are in the frozen files.
+
+Phase 2's `phase2_compare.py` completed with exit 0: all 334 named cases and
+outcomes match the builder, all required/control rows match, all 18 replay
+source hashes match, all 41 independent source/spec/fixture hashes remain
+unchanged, and all 11 previous assertion ASTs are preserved. The builder's
+69-path source check has a different, explicitly bounded selection.
+
+### V1 contract reconciliation and next human gate
+
+The parent incorrectly labeled a stricter named-assertion interpretation as
+human-approved in the initial verifier task. Approved A5 names the tests that
+must kill the mutants; handoff 33 describes exit 1 with the named test failing.
+A8 explicitly adds no new acceptance criterion. Neither establishes an
+assertion-only exception policy. Phase 2 disclosed this input error instead
+of treating it as an approved new product requirement.
+
+The timeout/baseline observation remains real. It does not establish inflation
+of the 17 official scores: their baseline suite passed and their kills were
+individually confirmed as assertions. A call-phase exception caused by a DUT
+mutation may legitimately be a behavioral test failure. Automatic rejection
+of all such exceptions is not an already-approved rule.
+
+The universal assertion-enforcement wording and tool-version labels have been
+qualified without changing implementation. Proposed V1 disposition is a
+contract/input-description issue, with optional strengthening separately
+specified. Paul owns final grading and the choice to retain the approved
+named-test-failure rule or approve new baseline/exception semantics. No new
+policy, code fix or additional blind round is automatic from this observation.
+
+Further rounds were explicitly authorized; historical failed rounds remain
+recorded. An optional blind planted-defect canary was not run. Reference canary
+and property tests are separate finite-domain checks, not universal proofs.
+No additional types, random fuzz, broad coverage or shuffled-full-suite layer
+was performed. Existing human exclusions remain. No source changed after
+verification, no Git mutation occurred, and no live recovery artifact,
+installed executable or shared database was touched.
+
+## Human disposition and documentary closure, 2026-10-04 UTC
+
+Paul was asked: "May I close this round under the existing named-test-failure
+rule, leaving stricter exception handling for a separately approved change?"
+He replied: "yes, what comes next?"
+
+The subsequent documentation-only request was: "May I update the evidence
+report and create handoff 41 now?" Paul replied: "yes".
+
+This records acceptance of the disclosed V1 contract/input-description
+correction and closure under the existing approved rule. It does not approve
+an assertion-only classifier, stronger baseline discrimination or any new
+behavior. Such changes require a separately approved specification and the
+full applicable coding and verification loop.
+
+The bounded Phase 2 PASS applies only to executable/test/spec state
+`6cb35e838d997e339ec4ccdc1dcd51853fbb7dce`. The stricter-input Phase 1 FAIL,
+prior failed rounds, handoffs 39/40 and frozen reports remain unchanged.
+Handoff `2026-10-04-41-codex` records this later human decision without
+rewriting those historical records.
+
+This closure changes documentation only. No tests, CUDA builds, mutation
+sweeps or independent verifier rounds were rerun for this update. The actual
+fresh runs above remain the evidence for the unchanged candidate; this
+appendix claims no new execution results.
+
+Next: Paul reviews and commits the four documentary files named in handoff
+41. A separate integration-review approval is then required. No staging,
+commit, merge, rebase, push, installed-executable replacement, recovery run,
+personal-artifact access or shared-database operation is authorized by this
+closure. No coordination-database gate was recorded or changed. Current
+shared-space readiness was not inspected and is not established here.
