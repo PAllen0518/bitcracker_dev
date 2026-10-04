@@ -46,7 +46,10 @@ def test_passed_named_test_is_a_survivor():
 
 def test_test_in_a_class_maps_to_its_classname():
     report = junit(("tests.test_x.TestGroup", "test_y", FAILURE))
-    assert driver.classify_test(1, report, "tests/test_x.py::TestGroup::test_y") == "killed"
+    assert (
+        driver.classify_test(1, report, "tests/test_x.py::TestGroup::test_y")
+        == "killed"
+    )
 
 
 OUTPUT = (
@@ -88,19 +91,39 @@ def test_real_pytest_report_layout_is_accepted():
 @pytest.mark.parametrize(
     "returncode,report",
     [
-        (1, junit((CLASSNAME, NAME, FAILURE)).replace("testsuites", "not_junit")),
-        (1, junit((CLASSNAME, NAME, FAILURE)).replace(
-            '<testsuite name="pytest">', '<testsuite name="pytest"><testsuite>'
-        ).replace("</testsuite>", "</testsuite></testsuite>")),
+        (
+            1,
+            junit((CLASSNAME, NAME, FAILURE)).replace(
+                "testsuites", "not_junit"
+            ),
+        ),
+        (
+            1,
+            junit((CLASSNAME, NAME, FAILURE))
+            .replace(
+                '<testsuite name="pytest">',
+                '<testsuite name="pytest"><testsuite>',
+            )
+            .replace("</testsuite>", "</testsuite></testsuite>"),
+        ),
         (0, junit((CLASSNAME, NAME, "<weird />"))),
         (1, junit((CLASSNAME, NAME, FAILURE + "<weird />"))),
         (1, junit((CLASSNAME, NAME, FAILURE + FAILURE))),
         (1, junit((CLASSNAME, NAME, FAILURE + SKIPPED))),
-        (1, junit((CLASSNAME, NAME, "<system-out>" + FAILURE + "</system-out>"))),
+        (
+            1,
+            junit(
+                (CLASSNAME, NAME, "<system-out>" + FAILURE + "</system-out>")
+            ),
+        ),
     ],
     ids=[
-        "wrong_root", "nested_testsuite", "unknown_child_on_pass",
-        "unknown_child_on_fail", "duplicate_failure", "two_outcomes",
+        "wrong_root",
+        "nested_testsuite",
+        "unknown_child_on_pass",
+        "unknown_child_on_fail",
+        "duplicate_failure",
+        "two_outcomes",
         "failure_hidden_in_output",
     ],
 )
@@ -120,8 +143,12 @@ def test_unsupported_report_structure_is_a_runner_error(returncode, report):
         ["--runner-control", "--report-control"],
     ],
     ids=[
-        "negative_with_only", "runner_with_only", "report_with_only",
-        "negative_and_runner", "negative_and_report", "runner_and_report",
+        "negative_with_only",
+        "runner_with_only",
+        "report_with_only",
+        "negative_and_runner",
+        "negative_and_report",
+        "runner_and_report",
     ],
 )
 def test_controls_cannot_be_combined(monkeypatch, arguments):
@@ -147,23 +174,38 @@ def test_report_fault_breaks_only_the_root():
 @pytest.mark.parametrize(
     "returncode,report",
     [
-        (4, junit()),                                   # test not found
-        (5, junit()),                                   # nothing collected
-        (2, junit((CLASSNAME, NAME, FAILURE))),         # interrupted
-        (3, junit((CLASSNAME, NAME, FAILURE))),         # internal error
-        (1, None),                                      # no report written
-        (1, "<testsuites><testsuite>"),                 # unreadable report
-        (1, junit((CLASSNAME, NAME, ERROR))),           # setup error, not a test failure
-        (0, junit((CLASSNAME, NAME, SKIPPED))),         # skipped: nothing ran
-        (1, junit((CLASSNAME, "test_other", FAILURE))),  # a different test failed
+        (4, junit()),  # test not found
+        (5, junit()),  # nothing collected
+        (2, junit((CLASSNAME, NAME, FAILURE))),  # interrupted
+        (3, junit((CLASSNAME, NAME, FAILURE))),  # internal error
+        (1, None),  # no report written
+        (1, "<testsuites><testsuite>"),  # unreadable report
+        (
+            1,
+            junit((CLASSNAME, NAME, ERROR)),
+        ),  # setup error, not a test failure
+        (0, junit((CLASSNAME, NAME, SKIPPED))),  # skipped: nothing ran
+        (
+            1,
+            junit((CLASSNAME, "test_other", FAILURE)),
+        ),  # a different test failed
         (1, junit((CLASSNAME, NAME, FAILURE), (CLASSNAME, "test_other", ""))),
-        (1, junit((CLASSNAME, NAME, ""))),              # exit 1 but the test passed
-        (0, junit((CLASSNAME, NAME, FAILURE))),         # exit 0 but the test failed
+        (1, junit((CLASSNAME, NAME, ""))),  # exit 1 but the test passed
+        (0, junit((CLASSNAME, NAME, FAILURE))),  # exit 0 but the test failed
     ],
     ids=[
-        "not_found", "no_tests", "interrupted", "internal_error", "no_report",
-        "unreadable_report", "setup_error", "skipped", "other_test",
-        "extra_test", "exit1_but_passed", "exit0_but_failed",
+        "not_found",
+        "no_tests",
+        "interrupted",
+        "internal_error",
+        "no_report",
+        "unreadable_report",
+        "setup_error",
+        "skipped",
+        "other_test",
+        "extra_test",
+        "exit1_but_passed",
+        "exit0_but_failed",
     ],
 )
 def test_anything_else_is_a_runner_error(returncode, report):
@@ -183,4 +225,209 @@ def test_anything_else_is_a_runner_error(returncode, report):
     ids=["all_killed", "survivor", "runner_error", "build_failed", "both"],
 )
 def test_exit_code(statuses, expected):
-    assert driver.exit_code([{"status": status} for status in statuses]) == expected
+    assert (
+        driver.exit_code([{"status": status} for status in statuses])
+        == expected
+    )
+
+
+CDATA_OUTPUT = (
+    "<system-out><![CDATA[<failure>not an element</failure>]]></system-out>"
+)
+ESCAPED_OUTPUT = "<system-err>&lt;error /&gt; printed by the test</system-err>"
+
+
+@pytest.mark.parametrize(
+    "returncode,inner,expected",
+    [
+        (1, CDATA_OUTPUT + FAILURE, "killed"),
+        (0, CDATA_OUTPUT, "survived"),
+        (1, ESCAPED_OUTPUT + FAILURE, "killed"),
+        (
+            0,
+            (
+                "<properties><property name='a' value='1' />"
+                "<property name='b' value='2' /></properties>"
+            ),
+            "survived",
+        ),
+    ],
+    ids=["cdata_kill", "cdata_survivor", "escaped_kill", "two_properties"],
+)
+def test_markup_as_text_is_accepted(returncode, inner, expected):
+    report = junit((CLASSNAME, NAME, inner))
+    assert driver.classify_test(returncode, report, TEST) == expected
+
+
+def suite_with(suite_inner, case_inner):
+    """Render a report with extra content at suite level beside the case."""
+    return (
+        '<testsuites><testsuite name="pytest">'
+        + suite_inner
+        + f'<testcase classname="{CLASSNAME}" name="{NAME}">{case_inner}'
+        "</testcase></testsuite></testsuites>"
+    )
+
+
+# Each case's exit code matches its visible outcome, so only the nesting
+# check can reject it.
+@pytest.mark.parametrize(
+    "returncode,report",
+    [
+        (
+            1,
+            junit(
+                (
+                    CLASSNAME,
+                    NAME,
+                    FAILURE
+                    + ("<system-err><error message='x' /></system-err>"),
+                )
+            ),
+        ),
+        (
+            0,
+            junit(
+                (
+                    CLASSNAME,
+                    NAME,
+                    ("<system-out><failure message='x' /></system-out>"),
+                )
+            ),
+        ),
+        (0, junit((CLASSNAME, NAME, "<properties><skipped /></properties>"))),
+        (
+            1,
+            junit(
+                (CLASSNAME, NAME, ("<failure message='x'><error /></failure>"))
+            ),
+        ),
+        (
+            0,
+            junit(
+                (
+                    CLASSNAME,
+                    NAME,
+                    (
+                        "<properties><property name='a' value='1'>"
+                        "<failure /></property></properties>"
+                    ),
+                )
+            ),
+        ),
+        (1, suite_with("<system-out><error /></system-out>", FAILURE)),
+        (1, suite_with("<properties><skipped /></properties>", FAILURE)),
+    ],
+    ids=[
+        "error_in_system_err",
+        "failure_in_system_out",
+        "skipped_in_properties",
+        "element_in_failure",
+        "element_in_property",
+        "suite_output_element",
+        "suite_properties_element",
+    ],
+)
+def test_hidden_elements_are_a_runner_error(returncode, report):
+    with pytest.raises(RuntimeError):
+        driver.classify_test(returncode, report, TEST)
+
+
+def test_hidden_error_fault_keeps_the_visible_failure():
+    report = junit((CLASSNAME, NAME, FAILURE))
+    faulted = driver.hide_report_error(report)
+    assert faulted != report
+    assert driver.classify_test(1, report, TEST) == "killed"
+    with pytest.raises(RuntimeError):
+        driver.classify_test(1, faulted, TEST)
+
+
+def control(
+    status="runner_error", build=0, test=1, clean="killed", restored=True
+):
+    """Describe one report-control result."""
+    return {
+        "status": status,
+        "build_exit_code": build,
+        "test_exit_code": test,
+        "clean_status": clean,
+        "restored": restored,
+    }
+
+
+@pytest.mark.parametrize(
+    "results,expected",
+    [
+        ([control(), control()], driver.EXIT_RUNNER_ERROR),
+        ([control(), control(status="killed")], driver.EXIT_CONTROL_BROKEN),
+        (
+            [control(status="killed"), control(status="killed")],
+            driver.EXIT_CONTROL_BROKEN,
+        ),
+        (
+            [control(), control(status="build_failed", test=None)],
+            driver.EXIT_CONTROL_BROKEN,
+        ),
+        ([control(), control(test=4)], driver.EXIT_CONTROL_BROKEN),
+        (
+            [control(), control(clean="runner_error")],
+            driver.EXIT_CONTROL_BROKEN,
+        ),
+        ([control()], driver.EXIT_CONTROL_BROKEN),
+        ([control(), control(restored=False)], driver.EXIT_CONTROL_BROKEN),
+        ([], driver.EXIT_CONTROL_BROKEN),
+    ],
+    ids=[
+        "both_held",
+        "one_counted_a_kill",
+        "both_counted_kills",
+        "build_failed",
+        "test_never_ran",
+        "report_already_invalid",
+        "missing_control",
+        "not_restored",
+        "nothing_ran",
+    ],
+)
+def test_report_control_exit(results, expected):
+    assert driver.report_control_exit(results) == expected
+
+
+@pytest.mark.parametrize("scope", ["suite", "testcase"])
+@pytest.mark.parametrize(
+    "container", ["system-out", "system-err", "properties"]
+)
+@pytest.mark.parametrize("tag", ["failure", "error", "skipped", "note"])
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_generated_hidden_descendants_are_rejected(
+    scope, container, tag, depth
+):
+    """Reject generated XML children regardless of visible outcome or depth."""
+    child = f"<{tag} />"
+    for _ in range(depth):
+        child = f"<property name='nested' value='x'>{child}</property>"
+    hidden = f"<{container}>{child}</{container}>"
+    for returncode in (0, 1):
+        outcome = FAILURE if returncode else ""
+        report = (
+            suite_with(hidden, outcome)
+            if scope == "suite"
+            else junit((CLASSNAME, NAME, hidden + outcome))
+        )
+        with pytest.raises(RuntimeError):
+            driver.classify_test(returncode, report, TEST)
+
+
+@pytest.mark.parametrize("scope", ["suite", "testcase"])
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_suite_and_case_text_output_remain_valid(scope, returncode):
+    """Preserve properties and markup-like output without element children."""
+    output = OUTPUT + CDATA_OUTPUT + ESCAPED_OUTPUT
+    outcome = FAILURE if returncode else ""
+    report = (
+        suite_with(output, outcome)
+        if scope == "suite"
+        else junit((CLASSNAME, NAME, output + outcome))
+    )
+    expected = "killed" if returncode else "survived"
+    assert driver.classify_test(returncode, report, TEST) == expected

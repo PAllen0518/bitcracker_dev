@@ -1,4 +1,13 @@
-# Generation-version binding — evidence report
+# Generation-version binding, evidence report
+
+## Current checkpoint, 2026-10-04 UTC
+
+The current fix is an **uncommitted working-tree candidate**, based on
+`c996a00d506a67dc1188e849fe451604b8c46944`. Its underlying reviewed code
+was `344c40acb2ee5cc4416d98cbe1923d980df3fec3`. Local validation appears
+in the final section below. Earlier results are historical, not certification
+of these working bytes. Round 4 failed despite its passing standard gauntlet.
+Fresh blind verification, commit, merge and shared-database setup are pending.
 
 Companion to `GENERATION_BINDING_SPEC.md` (approved, gate 1 cleared 2026-09-27).
 Loop: Old Coder. Risk tier 3. This report is written so the change can be trusted
@@ -499,3 +508,208 @@ Log `.cuda-build/r3fix-gauntlet.log` (git-ignored). Python 3.10.3, Ruff 0.15.18.
 4. `py -3.10 -m ruff check tests/test_cuda.py tests/test_cuda_cli.py tests/test_generation_pins.py tests/test_mutation_driver.py tools/validate_save_format.py --line-length 100`
 
 Status: Round 3 corrections complete in the worktree, uncommitted.
+
+## Descendant-report correction, 2026-10-04 UTC
+
+### Contract and historical failure
+
+The accepted correction rejects element children hidden inside JUnit outcomes
+or output. A property container may contain only property leaves. Legitimate
+properties, ordinary text, escaped markup and CDATA remain valid. Invalid
+reports must classify as `runner_error`, never as a kill or survivor.
+
+Round 4 reviewed code `344c40a` at docs-only HEAD `c996a00`. Both builds,
+237 tests, 17 required mutants and the original controls passed. Nevertheless,
+the independent verifier demonstrated a genuine named assertion failure with
+an added `<error>` inside `<system-err>`. The driver called it `killed` and
+returned gate 0. This was an independent **FAIL**, not certification.
+
+Frozen Round 4 artifacts are unchanged under
+`BitCracker/btcrecover-master/.cuda-build/verifier-round4/`:
+
+- Phase 1 SHA-256:
+  `2c68fac9bf1ace45bab7799a78405b2abd850ba01f5f9e1d71579d331eab5766`.
+- Phase 2 SHA-256:
+  `a68edb4d5180603cc681cff70d18f7ab67952e37149e9684d2c93c3fe7ec0a64`.
+- The 201-file artifact manifest SHA-256:
+  `f8c92047666d8219b803b1b4094839187c7ca277e0628563c459a54a8359c696`.
+
+### Implementation and source identity
+
+The takeover preserved the existing partial edits in the driver and its test
+file. Output and outcome elements are now leaves. Both suite and testcase
+output are checked. Properties contain only property leaves, so deeper
+descendants cannot conceal outcomes. No string blacklist is used.
+
+The original report-root control is retained. A second standalone control
+builds a real `drop_generation_check` mutant, verifies its named assertion
+fails cleanly, then adds a nested error while preserving that failure.
+`--report-control` succeeds as a diagnostic only when both controls build,
+execute, reject their injected reports and restore the source. It returns 2
+when both controls hold, otherwise 3. Faulted XML is retained for inspection.
+
+Working-file byte SHA-256 values at the local run:
+
+| File relative to `BitCracker/btcrecover-master` | SHA-256 |
+|---|---|
+| `tools/validate_save_format.py` | `f0119e261d9424d43374883d7ce2fa694511e20c1a3a411603b8b72a29df95c8` |
+| `tests/test_mutation_driver.py` | `c1b714d812797e91b9857c2ec7b8738caeeb733ec8677b831dbbe37c77ec09f4` |
+| `tools/generation_binding_gauntlet.py`, approved replay runner | `a98bc6a1e7553e67942653a621e29660a6c3bd28f6473d51e057b1570b4e88f0` |
+
+At the fresh local gauntlet, the approved spec's byte SHA-256 was
+`63497d447818ab14f2975842b9d57aedfe841723fcc2805b4378658b7a06b385`.
+Paul subsequently approved tracked inclusion of the replay runner with "yes"
+to the direct approval request. Append-only amendment A8 records this setup
+approval. The current spec's byte SHA-256 is
+`1a9b2c047c47b67b3c83c0e2675ce03460aacc7d98e4d9848c86e8e0c49eead9`.
+Only documentation changed after that gauntlet. All 18 recorded executable,
+test, harness and public-fixture hashes still match the tested source state.
+The original frozen local record retains its approval-pending status as
+history; checkpoint 38 records the later approval. Handoff 37 is unchanged.
+
+The three product files have no Git content diff from `b093dc8`. A fresh raw
+byte comparison found CRLF checkout bytes differ from that commit's LF blobs.
+Their LF-normalized bytes match. This qualifies earlier "byte-identical"
+wording, without changing the historical reports. Restoration is checked with
+raw-byte hashes against the actual current source, not normalized Git blobs.
+No product file was edited during this correction.
+
+### RED, GREEN and bounded checker gauntlet
+
+Commands below ran from `BitCracker/btcrecover-master` in the implementation
+worktree. This is local builder validation, not fresh independent verification.
+
+1. `python tools/generation_binding_gauntlet.py --phase red`
+   copied the committed `344c40a` checker and current descendant regressions
+   into an isolated directory. All **7 assertions failed**, each with
+   `DID NOT RAISE`; process exit 1 was the expected RED. The unrelated new
+   control tests were omitted only in that scratch copy because the old
+   checker lacks their constants. Candidate tests were not weakened.
+   Final RED artifacts: `.cuda-build/binding-red-eb0557d2/`.
+2. Before strengthening the partial control aggregator, the command
+   `python -m pytest tests/test_mutation_driver.py -q -k 'missing_control or not_restored'`
+   produced **2 failed** assertions. The partial implementation incorrectly
+   accepted both cases. Requiring both controls and successful restoration
+   made these tests pass.
+3. Focused GREEN is **149 passed**, comprising 135 driver tests and 14 pin
+   tests, under Python 3.14.6 / pytest 9.0.3 and Python 3.10.3 / pytest 9.0.2.
+   The 72 generated XML shapes exercise suite and testcase contexts, three
+   containers, four hidden tags, depths 0/1/3, and both pytest exits 0/1.
+   Positive tests preserve text, properties, escaped markup and CDATA,
+   including suite-level output. This is deterministic generated testing,
+   not a claimed Hypothesis or random-fuzz run.
+4. Four isolated checker mutants each produced assertion failures and exit 1:
+   allowing output children, allowing property descendants, ignoring suite
+   output, and accepting partial controls with `any`. No production source
+   was mutated for these probes. This is a separate **4/4** checker sweep,
+   not part of the required 17 native mutants.
+5. Coverage.py 7.13.5 measured **10/10 executable lines** across
+   `check_report_leaf` and `report_control_exit`. This is a narrow line gate,
+   not 100% whole-driver, native, branch or repository coverage.
+6. Ruff 0.16.0 and 0.15.18 both passed on the six scoped Python files, using
+   `--line-length 100 --extend-select RUF100,E402`, the established rule set.
+   New Python formatting uses 79 columns. A separate
+   `python -m ruff format --check tests/test_mutation_driver.py tools/generation_binding_gauntlet.py --line-length 79`
+   passed for both files. Whole-driver format certification is not claimed.
+
+The original 11 committed `assert` expressions in `test_mutation_driver.py`
+were compared as AST nodes and remain present unchanged after formatting.
+An initial scratch RED attempt failed at collection because of the new control
+constants; it was not counted as RED. Early replay-runner lint failures were
+corrected before the fresh all-layer run. These discarded attempts are not
+passes.
+
+### Fresh local replay and remaining gates
+
+Immediately before the builds, a read-only process check found no
+`multibit`, `optimized`, `bitcracker` or `btcrecover` recovery processes.
+The GPU query showed no compute-app recovery process. Only authorized builds
+and public/synthetic fixtures were used. No live checkpoint, installed
+recovery executable, personal token list or shared database was changed.
+
+After confirming recovery remains stopped, the replay command is:
+
+```powershell
+python tools/generation_binding_gauntlet.py
+```
+
+Actual fresh run artifacts: `.cuda-build/binding-all-72de1a55/`.
+Every subprocess has an individual `.json` command/exit record and `.log`.
+The suite has JUnit XML; helper coverage and source-copy hashes are retained.
+The runner fails on unexpected command exits, wrong mutant/control results,
+missing controls, absent genuine assertion failures or restoration mismatch.
+Native mutations operate only on an allowlisted copy under `.cuda-build`.
+
+| Layer | Actual result |
+|---|---|
+| Fresh `optimized_test` build | PASS, exit 0 |
+| Fresh `optimized` build | PASS, exit 0 |
+| Full `pytest tests -q` suite | 334 passed, exit 0, no skipped outcomes |
+| Required native mutants | 17/17 killed, build 0, test 1, restored, gate 0 |
+| Survivor negative control | `survived`, build 0, test 0, restored, gate 1 |
+| Runner-error control | `runner_error`, build 0, test 4, restored, gate 2 |
+| Root and nested report controls | Both `runner_error`, clean `killed`, build 0, test 1, restored, gate 2 |
+| Final raw-byte restoration | PASS, all 18 allowlisted source/fixture hashes match in both source trees |
+
+The replay command completed with exit 0. In both report controls the named
+test really failed before injection. The nested fault's exact diagnostic was
+`unexpected elements inside JUnit <system-err>: ['error']`.
+
+A separate read-only replay of these actual faulted XML files through the
+isolated `allow_output_children` checker mutant retained the root control as
+`runner_error`, misclassified the nested control as `killed`, and returned
+**gate 3**. This proves the two-control aggregator notices the missing defense.
+It reused the real reports, not a second native build or independent review.
+The following replay ran successfully, including its assertions:
+
+```powershell
+$reportProbe = @'
+import copy
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+output = Path('.cuda-build/binding-all-72de1a55')
+state = json.loads((output / 'restoration.json').read_text())
+source = Path(state['mutation_copy'])
+report = json.loads((source / '.cuda-build/save-format-mutation/'
+                     'mutation-report-control.json').read_text())
+path = output / 'allow_output_children/tools/validate_save_format.py'
+spec = importlib.util.spec_from_file_location('defeated_checker', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+results = copy.deepcopy(report['results'])
+for item in results:
+    xml = (source / item['faulted_report']).read_text(encoding='utf-8')
+    try:
+        item['status'] = module.classify_test(
+            item['test_exit_code'], xml, item['test'])
+    except RuntimeError as error:
+        item['status'] = 'runner_error'
+        item['runner_error'] = str(error)
+assert results[0]['status'] == 'runner_error'
+assert results[1]['status'] == 'killed'
+assert module.report_control_exit(results) == 3
+print('Defense removed: nested control falsely killed, gate 3')
+'@
+python -c $reportProbe
+```
+
+The full suite includes the property/reference canary, low-generation rejection
+and precedence cases, generation-1 stored-position restore, approved pin guard,
+the original checker tests and the new topology/control tests. The standalone
+controls are not included in the required mutation tally.
+
+No new types layer, repository-wide coverage gate, shuffled full-suite gate or
+random fuzz run was performed. The separately human-excluded workspace-backup
+shuffle issue remains out of scope. Earlier independent findings and failed
+rounds remain historical evidence, not erased by local GREEN.
+
+The next mandatory gate is Paul's commit, then a fresh blind verifier against
+that exact clean candidate. Its Phase 1 receives only the approved contract,
+spec, exact source state and replay commands, not this evidence, handoffs or
+prior findings. No new independent verdict exists for this working candidate.
+After the blind report freezes, Phase 2 may inspect the historical evidence.
+There is no authorization to merge or create the external shared database.

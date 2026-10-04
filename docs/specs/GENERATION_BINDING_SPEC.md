@@ -344,3 +344,30 @@ for A4; there is no behavior change and no ABI change. `multibit_cuda_threads.cu
 RED for each new check → GREEN → full gauntlet after the last edit → Paul commits →
 committed-source gauntlet → builder handoff → verifier Round 2 (the last round under
 the default cap).
+
+### A8. Replay-runner setup and file-scope amendment
+
+Approval recorded: 2026-10-04 UTC. Paul replied "yes" to the direct request,
+"May I include the replay runner in approved tracked scope?" This approval
+adds `tools/generation_binding_gauntlet.py` under
+`BitCracker/btcrecover-master` to A7's permitted file scope. Its approved
+working-file byte SHA-256 is:
+`a98bc6a1e7553e67942653a621e29660a6c3bd28f6473d51e057b1570b4e88f0`.
+
+The runner provides a persisted local entry point for existing checker tests,
+both established Ruff rule sets, narrow helper coverage, isolated checker
+mutations, both CUDA builds, the full suite, required native mutations and
+standalone controls. It copies only allowlisted public/synthetic inputs,
+records command exits and logs, and checks raw-byte source restoration.
+
+Setup uses Python's standard library and the existing pytest, Ruff and
+Coverage.py installations. No new dependency, installation, network access,
+product behavior, acceptance criterion or weakened assertion is authorized.
+Before any CUDA build or native replay, recovery-process and GPU safety
+checks remain required. This is not permission to run personal recovery,
+change a real checkpoint, replace an installed executable, merge a branch
+or initialize a shared database.
+
+Paul still owns staging and commits. Fresh committed-source validation and
+blind verification must follow his commit; this setup approval does not
+replace either gate. Earlier spec text remains historical and unchanged.

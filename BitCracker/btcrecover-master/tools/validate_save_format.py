@@ -1,13 +1,13 @@
 """Run fail-closed manual mutation tests for the v1 save format."""
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -16,7 +16,7 @@ BUILD = ROOT / ".cuda-build"
 REPORT_DIR = BUILD / "save-format-mutation"
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Edit:
     """Describe one exact-once source replacement."""
 
@@ -25,7 +25,7 @@ class Edit:
     after: str
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Mutant:
     """Describe one unique source mutation and its killing test."""
 
@@ -37,7 +37,7 @@ class Mutant:
     test: str
     executable_variable: str
     extra_edits: tuple = ()
-    report_fault: bool = False  # corrupt the JUnit root (report control only)
+    report_fault: str = ""  # "root" or "nested" (report controls only)
 
     def edits(self):
         """Return every edit, the primary one first."""
@@ -376,9 +376,10 @@ RUNNER_CONTROL = Mutant(
     executable_variable="CUDA_TEST_EXE",
 )
 
-# A real, divergent mutant whose named test genuinely runs and fails, but whose
-# JUnit report root is then corrupted. A report the driver does not recognize
-# must be a runner error, never a kill.
+# Real, divergent mutants whose named test genuinely runs and fails, but whose
+# JUnit report is then corrupted: its root renamed, or an <error> hidden inside
+# <system-err>. A report the driver does not recognize must be a runner error,
+# never a kill.
 REPORT_CONTROL = Mutant(
     name="report_error_control",
     source=SAVE_FORMAT,
@@ -387,8 +388,12 @@ REPORT_CONTROL = Mutant(
     build_target="optimized_test",
     test="tests/test_cuda.py::test_native_contract[save_reject_generation]",
     executable_variable="CUDA_TEST_EXE",
-    report_fault=True,
+    report_fault="root",
 )
+REPORT_NESTED_CONTROL = dataclasses.replace(
+    REPORT_CONTROL, name="report_nested_control", report_fault="nested"
+)
+REPORT_CONTROLS = [REPORT_CONTROL, REPORT_NESTED_CONTROL]
 
 
 def corrupt_report_root(junit_text):
@@ -403,6 +408,33 @@ def corrupt_report_root(junit_text):
 EXIT_ALL_KILLED = 0
 EXIT_SURVIVOR = 1
 EXIT_RUNNER_ERROR = 2
+EXIT_CONTROL_BROKEN = 3  # a report control did not hold
+
+
+def hide_report_error(junit_text):
+    """Hide an <error> inside <system-err> of the test case, beside its outcome."""
+    root = ElementTree.fromstring(junit_text)
+    case = next(root.iter("testcase"))
+    hidden = ElementTree.SubElement(case, "system-err")
+    ElementTree.SubElement(hidden, "error", message="injected hidden error")
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+def report_control_exit(results):
+    """Return 2 only if every report control held, else EXIT_CONTROL_BROKEN.
+
+    Both controls must run, fail cleanly before injection, reject the fault,
+    and restore their source bytes.
+    """
+    held = len(results) == len(REPORT_CONTROLS) and all(
+        item.get("build_exit_code") == 0
+        and item.get("test_exit_code") == 1
+        and item.get("clean_status") == "killed"
+        and item.get("restored") is True
+        and item["status"] == "runner_error"
+        for item in results
+    )
+    return EXIT_RUNNER_ERROR if held else EXIT_CONTROL_BROKEN
 
 
 def junit_identity(test):
@@ -417,12 +449,32 @@ OUTCOME_TAGS = {"failure", "error", "skipped"}
 OUTPUT_TAGS = {"properties", "system-out", "system-err"}
 
 
+def check_report_leaf(element):
+    """Require an outcome or output element to hold text only, else raise.
+
+    <properties> may hold only childless <property> elements. Text, escaped
+    markup and CDATA are fine; nested elements could hide an outcome.
+    """
+    if element.tag == "properties":
+        for item in element:
+            if item.tag != "property" or len(item):
+                raise RuntimeError(
+                    f"unexpected JUnit <properties> content: <{item.tag}>"
+                )
+    elif len(element):
+        raise RuntimeError(
+            f"unexpected elements inside JUnit <{element.tag}>: "
+            f"{sorted({child.tag for child in element})}"
+        )
+
+
 def report_testcase(root):
     """Return the single test case of a pytest JUnit report, else raise.
 
     Accepted: <testsuites> holding one <testsuite>, or a bare <testsuite>.
     The suite holds exactly one <testcase> plus optional output elements, and
-    the case holds only outcome and output elements.
+    the case holds only outcome and output elements. Properties contain only
+    property leaves; other output and outcome elements hold text only.
     """
     suite = root
     if root.tag == "testsuites":
@@ -443,6 +495,11 @@ def report_testcase(root):
     unknown = {child.tag for child in cases[0]} - OUTCOME_TAGS - OUTPUT_TAGS
     if unknown:
         raise RuntimeError(f"unexpected JUnit test content: {sorted(unknown)}")
+    for element in suite:
+        if element.tag != "testcase":
+            check_report_leaf(element)
+    for element in cases[0]:
+        check_report_leaf(element)
     return cases[0]
 
 
@@ -608,8 +665,24 @@ def run_mutant(mutant):
             junit.read_text(encoding="utf-8") if junit.exists() else None
         )
         if mutant.report_fault and junit_text is not None:
-            junit_text = corrupt_report_root(junit_text)
-            result["report_fault"] = "JUnit root renamed to not_junit"
+            # Classify the untouched report first, so a control only holds when
+            # the injected fault alone turns a real kill into a runner error.
+            try:
+                result["clean_status"] = classify_test(
+                    test.returncode, junit_text, mutant.test
+                )
+            except RuntimeError as error:
+                result["clean_status"] = "runner_error"
+                result["clean_runner_error"] = str(error)
+            if mutant.report_fault == "root":
+                junit_text = corrupt_report_root(junit_text)
+                result["report_fault"] = "JUnit root renamed to not_junit"
+            else:
+                junit_text = hide_report_error(junit_text)
+                result["report_fault"] = "<error> hidden inside <system-err>"
+            faulted_report = junit.with_name(f"{mutant.name}-faulted.xml")
+            faulted_report.write_text(junit_text, encoding="utf-8")
+            result["faulted_report"] = str(faulted_report.relative_to(ROOT))
         try:
             result["status"] = classify_test(
                 test.returncode, junit_text, mutant.test
@@ -669,7 +742,7 @@ def main():
     if arguments.runner_control:
         selected = [RUNNER_CONTROL]
     if arguments.report_control:
-        selected = [REPORT_CONTROL]
+        selected = REPORT_CONTROLS
     if arguments.only:
         known = {mutant.name: mutant for mutant in MUTANTS}
         unknown = sorted(set(arguments.only) - set(known))
@@ -708,6 +781,8 @@ def main():
         )
         if "runner_error" in item:
             print(f"  runner error: {item['runner_error']}")
+    if arguments.report_control:
+        return report_control_exit(results)
     return exit_code(results)
 
 
